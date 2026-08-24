@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"name": "OSpRad_firmware (sketch)",
+			"path": "firmware/OSpRad_firmware"
+		},
+		{
+			"name": "OSpRad (repo)",
+			"path": "."
+		}
+	],
+	"settings": {}
+}

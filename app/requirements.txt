@@ -1,0 +1,5 @@
+matplotlib
+pyserial
+numpy
+scipy
+sv-ttk

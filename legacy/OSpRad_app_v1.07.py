@@ -75,8 +75,8 @@ else:
                 com_list.append(p.device)
 
         print(com_list)
-        #serialName = '/dev/ttyUSB0'
-        serialName = com_list[0]
+        usb_ports = [p for p in com_list if 'USB' in p or 'ACM' in p]
+        serialName = usb_ports[0] if usb_ports else com_list[0]
         ser = serial.Serial(serialName, 115200)
 
 

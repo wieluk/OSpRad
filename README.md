@@ -1,4 +1,4 @@
-# OSpRad
+# OSpRad 3.1.0
 ## An open-source, low-cost, high-sensitivity spectroradiometer
 
 Developed by Jolyon Troscianko - 2022
@@ -13,16 +13,36 @@ Included in this project are the 3D STL files for creating your own housing, cod
 
 Code and data are released without any form of warranty, and the author accepts no liability.
 
+## Repository layout
+
+| Folder | Contents |
+| --- | --- |
+| `app/` | The Python app. Run `app/OSpRad.py`. Also holds calibration_data.csv, and data.csv is written here. |
+| `firmware/` | Arduino Nano sketch (open the folder in the Arduino IDE). |
+| `3D components/` | STL files for 3D printing the housing, shutter wheel and caps. |
+| `calibration/` | Spreadsheets used to derive calibration data (see Calibration below). |
+| `legacy/` | Previous app and firmware versions, kept for units that have not been updated. |
+
 ## User interface app
-OSpRad units are controlled through the included graphical user interface. This is written in Python 3, and can run from desktop computers (currently Linux) or Android smartphones (requires Pydroid 3 app). Simply plug in the OSpRad via USB and run this code to launch the app. The OSpRad communicates via serial connection and the USB also provides power. The app has a few dependences in Python: tkinter, matplotlib, serial, (and for Android) usb4a and usbserial4a. Calibration data for the OSpRad units must be provided by placing the calibration_data.csv file (with relevant data for each specific unit#) in the same directory as you're launching the code from. Spectral data are stored in data.csv in the same directory.
+OSpRad units are controlled through the included graphical user interface. This is written in Python 3, and can run from desktop computers (currently Linux) or Android smartphones (requires Pydroid 3 app). Simply plug in the OSpRad via USB and run `app/OSpRad.py` to launch the app. The OSpRad communicates via serial connection and the USB also provides power.
+
+The app is split across several files, all of which live in the `app` folder and must stay together: `OSpRad.py` (the file you run), `serial_io.py`, `calibration.py`, `calibration_wizard.py`, `plotting.py`, `datalog.py` and `analysis.py`.
+
+Python dependences: tkinter, matplotlib, pyserial, numpy, scipy, sv-ttk, (and for Android) usb4a and usbserial4a. On a desktop these can be installed with `pip install -r app/requirements.txt`. Note that tkinter is not a pip package - on Linux install your distribution's python3-tkinter package.
+
+Calibration data for the OSpRad units must be provided by placing the calibration_data.csv file (with relevant data for each specific unit#) in the `app` folder alongside the code. Spectral data are written to data.csv in that same folder, whichever directory you launch the app from.
+
+**The app and the firmware are released together and their major versions must match** (currently 3.x) - a 3.x app will not talk to 1.x or 2.x firmware, or vice versa. If the app reports an unexpected reply when connecting, reflash the unit (see below).
 ![image](https://user-images.githubusercontent.com/53558556/206735364-3b1cf770-dc8e-4b96-9161-38993c282523.png)
 
 The app saves all relevant data, including calibrated watts/(sqm * nm) or watts/(sr * sqm * nm), raw count data, integration time, number of saturated photosites (to ensure measurement isn't over-exposed), number of scans averaged, time and date of the the measurement, and a label if one was chosen.
 
 Repeat measurements can be made by ticking the relevant checkbox (for data logging), specify whether to measure radiance, irradiance, or both, and the frequency (in seconds).
 
+Note: `data.csv` files produced by OSpRad 1.x are not compatible with this version (the column layout changed when the firmware gained the framed reply protocol); re-measure with the 3.x firmware to use this app's history browser.
+
 ## App running from smart phone
-To run from an Android phone, install Pydroid 3, use pip to install the dependences (this requires an additional app, just follow the on-screen instructions). Then connect the phone to the OSpRad and run the code. Ensure the calibration_data.csv file is in the same directory as this python code. Most modern phones have a USB-C port, so you'll need a USB-C to USB-A (female receptacle). Which is a standard cable. Older phones with a USB-micro port require a USB-micro OTG to USB-mini cable (less common, but easy to buy online).
+To run from an Android phone, install Pydroid 3, use pip to install the dependences (this requires an additional app, just follow the on-screen instructions). Copy the whole `app` folder onto the phone, then open and run `OSpRad.py` from within it - the other modules must sit beside it so Pydroid can find them. Ensure the calibration_data.csv file is in that same folder. Most modern phones have a USB-C port, so you'll need a USB-C to USB-A (female receptacle). Which is a standard cable. Older phones with a USB-micro port require a USB-micro OTG to USB-mini cable (less common, but easy to buy online).
 ![image](https://user-images.githubusercontent.com/53558556/207035761-f31efe3d-daf0-49bf-aa4e-54de707b840e.png)
 
 # Construction
@@ -49,14 +69,34 @@ Solder the parts together as shown below. Roughly 10cm lengths of wire should be
 ![Circuit Diagram](https://user-images.githubusercontent.com/53558556/206735133-19c5051f-9946-49dd-95c0-88d3e2ee12a0.png)
 
 ## Arduino code
-Use Arduino IDE to flash the firmware code to the Arduino Nano. There are four numbers in the code that you'll need to change in the supplied code (shown in comments at the top of the script). This is the ID of the unit (each unit needs its own ID so it can look up its calibration data) and the shutter wheel positions that correspond to "closed", "radiance" and "irradiance" measurement positions. Once you've flashed the code to the Arduino you can make a serial connection link within Arduino IDE (baud rate 115200) and send "w90" to the OSpRad. This will move the servo to its central position. Now it's in this position, remove the shutter wheel from the servo and re-attach it in the nearest position to "closed" (central) as possible, to get it roughly into the correct place. Next, use the same wheel position function ("w" plus number) to work out the precise numbers associated with the three required positions. The script contains a range of examples and your numbers should be similar. Once you've found the positions, update the numbers in the Arduino code and re-flash the Arduino Nano. Now the shutter wheel will move to the correct positions.
+Use Arduino IDE to flash `firmware/OSpRad_firmware/` to the Arduino Nano. Unlike earlier versions, you do **not** need to edit anything in the sketch before flashing - the unit number and the three shutter wheel positions are stored in the Arduino's EEPROM and are set from the app instead. The same firmware can therefore be flashed to every unit you build, and you only ever need to flash a unit once.
+
+Setting up a newly built unit:
+
+1. Flash the firmware, connect the OSpRad via USB and launch the app.
+2. Open the **Calibration** tab, then **Unit & wheel setup**.
+3. Enter the unit number (each unit needs its own ID so it can look up its calibration data) and press *Save unit number*.
+4. Move the wheel to 90 degrees using the slider. With the wheel at this central position, remove the shutter wheel from the servo and re-attach it as close to "closed" as possible, to get it roughly into the correct place.
+5. Jog the slider (or the +/- buttons) to find each of the three positions in turn, pressing *Set as Dark*, *Set as Irradiance* and *Set as Radiance* once each one lines up. Dark is the closed central position, irradiance uses the cosine diffuser, and radiance is the clear aperture.
+
+Each setting is written to the Arduino as soon as you save it, and the panel at the top of the tab shows the values currently stored on the unit.
+
+If you prefer to work by hand, the firmware still accepts commands over a 115200 baud serial connection: `w<angle>` moves the wheel, `sD`/`sI`/`sR` save the current angle as the dark/irradiance/radiance position, `u<n>` sets the unit number, and `g` reports the stored configuration.
 
 # Calibration
-Calibration data for each OSpRad unit are stored in calibration_data.csv, using tab delineation. The file takes the following format:
+Calibration data for each OSpRad unit are stored in calibration_data.csv, using comma delineation. The file takes the following format:
 
 ![image](https://user-images.githubusercontent.com/53558556/206896550-cf35ebd2-01a4-46ef-b638-2797bc92ab76.png)
 
-The first column stores the unit#. This is the ID given to each unit (flashed to the Arduino Nano, see above). Each unit requires four rows of calibration data
+The first column stores the unit#. This is the ID given to each unit (stored in the Arduino's EEPROM, see above). Each unit requires four rows of calibration data
+
+## Calibrating from the app
+Much of the calibration below can now be done from the app's **Calibration** tab rather than by hand in the spreadsheets. Anything saved there is written straight into calibration_data.csv.
+
+- **Linearisation** measures one steady light source across a range of integration times and fits the linCoefs automatically. Use a source that does not flicker - daylight or an incandescent lamp are ideal, but most LED and fluorescent lighting is not. Because these coefficients set the overall scale of the linearised signal, re-derive or rescale the spectral sensitivity afterwards.
+- **Spectral sensitivity** offers three routes: import a 288-value curve from a file (for example exported from the "sensitivity FINAL" sheet of calibration/calibration_calculations.ods), rescale the existing curve against a single known luminance/illuminance reading, or derive a new curve from scratch by measuring a source whose true spectrum you have already recorded on a reference spectroradiometer.
+
+The spreadsheets remain the reference for the full derivation, and are still the better route if you want to inspect every intermediate step.
 
 This includes:
 
@@ -80,7 +120,7 @@ You can either measure this yourself for unit-specific linearisation values, or 
 
 
 ## Spectral sensitivity calibration "radSens" and "irrSens"
-[288 numbers each] This requires access to a calibrated light source (with known emission spectra). Measure that source with the OSpRad in radiance and irradiance modes. See the included calibration spreadsheet to see how spectral radiance and irradiance calibration data are created.
+[288 numbers each] This requires access to a calibrated light source (with known emission spectra). Measure that source with the OSpRad in radiance and irradiance modes. See the spreadsheets in the calibration folder to see how spectral radiance and irradiance calibration data are created.
 
 Alternatively, you could simply use the included data as a template, but this would cause some error as there are unit-specific spectral sensitivity differences:
 
