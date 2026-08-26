@@ -1,0 +1,426 @@
+name: Package and release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to stamp into the artifacts (blank = use app/_version.py)'
+        type: string
+        default: ''
+      windows:
+        description: 'Build Windows .exe'
+        type: boolean
+        default: true
+      linux:
+        description: 'Build Linux AppImage/tarball'
+        type: boolean
+        default: true
+      macos:
+        description: 'Build macOS .app'
+        type: boolean
+        default: true
+      android:
+        description: 'Build Android .apk (slow - 20-40+ minutes)'
+        type: boolean
+        default: true
+      wheel:
+        description: 'Build the Python wheel'
+        type: boolean
+        default: true
+      create_release:
+        description: 'Create a draft GitHub Release from whatever was built'
+        type: boolean
+        default: false
+      publish_pypi:
+        description: 'Publish the wheel to PyPI'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Code checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Python tooling
+        run: pip install ruff==0.16.4 -r app/requirements.txt
+
+      - name: Ruff
+        run: ruff check app packaging
+
+      - name: Byte-compile
+        run: python -m compileall -q app packaging
+
+      # libQt6Gui links against these unconditionally, so importing PySide6 fails
+      # on a bare runner even under the offscreen platform.
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libegl1 libgl1 libxkbcommon0 libfontconfig1
+
+      - name: Import every app module
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python - <<'PY'
+          import importlib, pathlib, sys
+          sys.path.insert(0, 'app')
+          for path in sorted(pathlib.Path('app').glob('*.py')):
+              print('importing', path.stem)
+              importlib.import_module(path.stem)
+          PY
+
+      - name: Shellcheck
+        run: |
+          sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning packaging/*/*.sh
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $want = '1.25.0'
+          if (-not (Get-Module -ListAvailable PSScriptAnalyzer | Where-Object { $_.Version -eq $want })) {
+            Install-Module PSScriptAnalyzer -RequiredVersion $want -Force -Scope CurrentUser
+          }
+          Import-Module PSScriptAnalyzer -RequiredVersion $want
+          $issues = Invoke-ScriptAnalyzer -Path packaging/windows -Recurse -Severity Error,Warning
+          $issues | Format-Table -AutoSize
+          if ($issues) { exit 1 }
+
+      - name: Actionlint
+        run: |
+          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/v1.7.12/scripts/download-actionlint.bash) 1.7.12
+          ./actionlint -color
+
+      # arduino-cli only accepts a sketch whose .ino sits in a folder of the same
+      # name, which the flat firmware/ layout is not - so stage one to compile.
+      - name: Stage the sketch
+        run: |
+          mkdir -p /tmp/sketch/OSpRad_firmware
+          cp firmware/OSpRad_firmware.ino /tmp/sketch/OSpRad_firmware/
+
+      - name: Compile the firmware
+        uses: arduino/compile-sketches@v1.1.3
+        with:
+          fqbn: arduino:avr:nano
+          platforms: |
+            - name: arduino:avr
+              version: 1.8.8
+          sketch-paths: /tmp/sketch/OSpRad_firmware
+          libraries: |
+            - name: Servo
+              version: 1.3.0
+
+      - name: Version consistency
+        run: python packaging/check_versions.py
+
+  prepare:
+    name: Resolve version
+    needs: checks
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - id: resolve
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            version="${{ inputs.version }}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(sed -n "s/^__version__ = '\(.*\)'$/\1/p" app/_version.py)
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building version $version"
+
+      # A dispatch may stamp a version the checkout doesn't carry; every build job
+      # applies this the same way so nothing ends up half-stamped.
+      - name: Stamp app/_version.py
+        run: printf "__version__ = '%s'\n" "${{ steps.resolve.outputs.version }}" > /tmp/_version.py
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: version-stamp
+          path: /tmp/_version.py
+
+  windows:
+    name: Windows
+    needs: prepare
+    if: inputs.windows || github.ref_type == 'tag'
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: version-stamp
+          path: app
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+      - run: pip install -r app\requirements.txt pyinstaller==6.22.2
+      - run: packaging\windows\build_windows.ps1
+      - name: Name the asset
+        run: |
+          mkdir dist
+          move packaging\windows\dist\OSpRad.exe "dist\OSpRad-$env:VERSION-windows-x64.exe"
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: OSpRad-windows
+          path: dist/*
+          if-no-files-found: error
+
+  linux:
+    name: Linux
+    needs: prepare
+    if: inputs.linux || github.ref_type == 'tag'
+    # Older than ubuntu-latest on purpose: an AppImage inherits the builder's glibc, and 22.04 is already the floor PySide6's manylinux_2_34 wheels allow.
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: version-stamp
+          path: app
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+      - run: pip install -r app/requirements.txt pyinstaller==6.22.2
+
+      # PyInstaller's PySide6 hooks import QtGui to collect its data files, so the
+      # build needs the same libraries the checks job does.
+      - name: Install Qt runtime libraries
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libegl1 libgl1 libxkbcommon0 libfontconfig1
+
+      # Without this the build silently falls back to a tarball. Runners have no
+      # FUSE, so the appimagetool AppImage has to unpack itself to run; APPIMAGE_EXTRACT_AND_RUN
+      # in the build step below tells its runtime to do that.
+      - name: Install appimagetool
+        run: |
+          sudo curl -sSL -o /usr/local/bin/appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage
+          sudo chmod +x /usr/local/bin/appimagetool
+
+      - name: Build
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: bash packaging/linux/build_linux.sh
+
+      - name: Name the assets
+        run: |
+          mkdir -p dist
+          if [ -f packaging/linux/dist/OSpRad-x86_64.AppImage ]; then
+            cp packaging/linux/dist/OSpRad-x86_64.AppImage \
+              "dist/OSpRad-${VERSION}-linux-x86_64.AppImage"
+          else
+            echo "::warning::appimagetool produced no AppImage - shipping the tarball only"
+          fi
+          tar -C packaging/linux/dist -czf "dist/OSpRad-${VERSION}-linux-x86_64.tar.gz" OSpRad
+          ls -la dist
+
+      # Catches a glibc/shared-lib mismatch before it reaches a user - nobody here can test Linux manually.
+      - name: Smoke test the built app
+        env:
+          QT_QPA_PLATFORM: offscreen
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          BIN="dist/OSpRad-${VERSION}-linux-x86_64.AppImage"
+          [ -f "$BIN" ] || BIN="packaging/linux/dist/OSpRad/OSpRad"
+          chmod +x "$BIN"
+          "$BIN" &
+          pid=$!
+          sleep 5
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "Smoke test passed: app launched and is still running after 5s"
+            kill "$pid"
+            wait "$pid" 2>/dev/null || true
+          else
+            wait "$pid"; ec=$?
+            echo "::error::App exited early during smoke test (exit code $ec) - see output above for the failure"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: OSpRad-linux
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    name: macOS
+    needs: prepare
+    if: inputs.macos || github.ref_type == 'tag'
+    runs-on: macos-latest
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: version-stamp
+          path: app
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+      - run: pip install -r app/requirements.txt pyinstaller==6.22.2
+      - run: bash packaging/macos/build_macos.sh
+
+      # upload-artifact on a raw .app loses the executable bit and its symlinks,
+      # so zip the bundle here rather than let the artifact upload do it.
+      - name: Zip the bundle
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent packaging/macos/dist/OSpRad.app \
+            "dist/OSpRad-${VERSION}-macos.zip"
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: OSpRad-macos
+          path: dist/*
+          if-no-files-found: error
+
+  android:
+    name: Android
+    needs: prepare
+    if: inputs.android || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: version-stamp
+          path: app
+
+      - name: Free disk space (NDK/JDK download + native builds need several GB)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.11'
+
+      - name: Build
+        env:
+          OSPRAD_VERSION: ${{ needs.prepare.outputs.version }}
+        run: bash packaging/android/build_full_app.sh /tmp/ab
+
+      - name: Name the asset
+        run: |
+          mkdir -p dist
+          apk=$(find /tmp/ab/osprad_full -maxdepth 2 -iname '*.apk' | head -1)
+          [ -n "$apk" ] || { echo "no APK produced"; exit 1; }
+          cp "$apk" "dist/OSpRad-${VERSION}-android-arm64.apk"
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: OSpRad-android
+          path: dist/*
+          if-no-files-found: error
+
+  wheel:
+    name: Wheel
+    needs: prepare
+    if: inputs.wheel || github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: version-stamp
+          path: app
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.12'
+      - run: pip install build==1.5.0
+      - run: python -m build --outdir dist
+
+      - name: Check the built version matches
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          ls dist
+          shopt -s nullglob
+          matches=(dist/*"$VERSION"*)
+          if [ ${#matches[@]} -eq 0 ]; then
+            echo "no file in dist/ carries version $VERSION"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7.0.1
+        with:
+          name: OSpRad-wheel
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: GitHub Release
+    needs: [prepare, windows, linux, macos, android, wheel]
+    # always() so a deselected (skipped) target doesn't block the release, but
+    # never publish a release that is quietly missing a target that actually failed.
+    if: |
+      always() && !cancelled()
+      && !contains(needs.*.result, 'failure')
+      && (github.ref_type == 'tag' || inputs.create_release)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          path: artifacts
+          pattern: OSpRad-*
+          merge-multiple: true
+
+      - name: Require at least one artifact
+        run: |
+          ls -la artifacts
+          [ -n "$(ls -A artifacts 2>/dev/null)" ] || { echo "nothing was built"; exit 1; }
+
+      - uses: softprops/action-gh-release@v3.0.2
+        with:
+          tag_name: v${{ needs.prepare.outputs.version }}
+          name: OSpRad ${{ needs.prepare.outputs.version }}
+          draft: ${{ github.ref_type != 'tag' }}
+          generate_release_notes: true
+          files: artifacts/*
+
+  pypi:
+    name: Publish to PyPI
+    needs: [prepare, wheel]
+    if: github.ref_type == 'tag' || inputs.publish_pypi
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted Publishing: no API token secret, but the publisher must be registered
+      # once on PyPI for this repo + workflow package.yml + environment pypi.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8.0.1
+        with:
+          name: OSpRad-wheel
+          path: dist
+      # PyPI refuses to accept a filename it has already seen, so without this any
+      # re-run of an already-published version fails with "400 File already exists".
+      # Skipping keeps re-runs (and a re-pushed tag) idempotent.
+      - uses: pypa/gh-action-pypi-publish@v1.14.2
+        with:
+          skip-existing: true

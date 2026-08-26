@@ -1,9 +1,5 @@
-# OSpRad 3.1.0
-# Released under GPL-3.0 license
-# https://github.com/troscianko/OSpRad
-
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 import numpy as np
 
 Y_LABELS = {
@@ -14,7 +10,7 @@ Y_LABELS = {
 LIGHT = {'bg': '#fafafa', 'fg': '#1c1c1c', 'grid': '#c8c8c8'}
 DARK = {'bg': '#1c1c1c', 'fg': '#fafafa', 'grid': '#4a4a4a'}
 
-# The spectral gradient wash only reads sensibly for a single curve, so overlays get a
+# The spectral gradient only reads sensibly for a single curve, so overlays get a
 # plain line cycling through this list.
 OVERLAY_COLORS = ['#2e86ab', '#d1495b', '#2a9d8f', '#e9c46a', '#8338ec', '#f4a261']
 
@@ -52,11 +48,14 @@ def wavelength_to_rgb(nm):
 
 
 class SpectrumPlot:
-    def __init__(self, parent, dark=False):
+    """Matplotlib Figure wrapped in a Qt canvas (self.canvas - add it to a layout to
+    display), with hover/multi-curve/theme logic shared by the main window's live +
+    history plots and every calibration-wizard tab's preview plot."""
+
+    def __init__(self, dark=False):
         self.figure = Figure(figsize=(5, 5), tight_layout=True)
         self.ax = self.figure.add_subplot(1, 1, 1)
-        self.canvas = FigureCanvasTkAgg(self.figure, parent)
-        self.widget = self.canvas.get_tk_widget()
+        self.canvas = FigureCanvasQTAgg(self.figure)
         self._last = None
         self._curves = {}
         # Set by the owner to receive '<wavelength> nm   <value>' hover text.
@@ -115,16 +114,15 @@ class SpectrumPlot:
         self.ax.plot(w, y, color=self.colors['fg'], linewidth=1.4, zorder=3)
         self.canvas.draw()
 
-    # ---------------- multi-curve overlay API ----------------
-    # OSpRad.py's main-window plot uses add_curve() so the live curve and overlaid past
-    # readings can share axes + legend. update() above stays unchanged because the
-    # calibration wizard calls it directly.
+    # multi-curve overlay API used by OSpRad.py's main window so the live curve and
+    # overlaid past readings can share axes + legend. update() stays unchanged because
+    # the calibration wizard calls it directly.
 
     def add_curve(self, name, wavelength, flux, mode=None, title=None, style='overlay',
                   color=None, label=None):
-        """style='live' is the current/just-taken measurement (spectral-gradient wash,
-        replaces any previous curve of that name). style='overlay' is a reloaded or
-        compared past reading (plain line, cycles through OVERLAY_COLORS)."""
+        """style='live' = current/just-taken measurement (with gradient wash, replaces
+        any previous curve of that name). style='overlay' = compared past reading
+        (plain line cycling through OVERLAY_COLORS)."""
         self._curves[name] = {
             'wavelength': wavelength, 'flux': flux, 'mode': mode, 'title': title,
             'style': style, 'color': color, 'visible': True, 'label': label or title or name,
@@ -170,7 +168,7 @@ class SpectrumPlot:
         self.ax.set_ylim(0, top * 1.08)
 
         color_i = 0
-        for name, c in visible:
+        for _, c in visible:
             w = np.asarray(c['wavelength'])
             y = np.asarray(c['flux'])
             if c['style'] == 'live':
@@ -195,8 +193,8 @@ class SpectrumPlot:
         image.set_clip_path(fill.get_paths()[0], transform=self.ax.transData)
 
     def _primary_curve(self):
-        """Curve the cursor readout tracks: the live scan if visible, else whichever
-        visible curve was added most recently."""
+        """Curve the cursor readout tracks: the live scan if visible, else the most
+        recently added visible curve."""
         live = self._curves.get('live')
         if live and live['visible']:
             return 'live', live

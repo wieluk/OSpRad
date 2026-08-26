@@ -1,5 +1,13 @@
-matplotlib
-pyserial
-numpy
-scipy
-sv-ttk
+# Pinned so an upstream release can't change what CI and the packaged builds produce.
+# Bump these deliberately, not by accident. PySide6 is held at the same version as
+# PYSIDE_VERSION in packaging/android/build_full_app.sh so desktop and Android agree.
+#
+# Note these pins need Python >= 3.12 (numpy 2.5). Every job that reads this file uses
+# 3.12; the Android build does not read it at all - p4a resolves its own versions.
+matplotlib==3.11.1
+pyserial==3.5
+numpy==2.5.2
+PySide6==6.11.2
+
+# scipy is only needed for the Monitor calibration tab's .mat export (no Android build).
+# scipy==1.18.0

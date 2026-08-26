@@ -1,7 +1,3 @@
-# OSpRad 3.1.0
-# Released under GPL-3.0 license
-# https://github.com/troscianko/OSpRad
-
 import csv
 import math
 import os
@@ -11,8 +7,7 @@ PIXELS = 288
 CSV_COLUMNS = 290  # calibration_data.csv is a fixed-width spreadsheet export
 
 # CIE 1931 2-degree color-matching functions (Wyman, Sloan & Shirley, 2013), as a
-# closed-form piecewise-Gaussian fit. Each entry is a lobe:
-# (amplitude, mu, sigma_below, sigma_above).
+# piecewise-Gaussian fit. Each entry is one lobe: (amplitude, mu, sigma_below, sigma_above).
 CIE_X_COEFS = [(1.056, 599.8, 37.9, 31.0), (0.362, 442.0, 16.0, 26.7), (-0.065, 501.1, 20.4, 26.2)]
 CIE_Y_COEFS = [(0.821, 568.8, 46.9, 40.5), (0.286, 530.9, 16.3, 31.1)]
 CIE_Z_COEFS = [(1.217, 437.0, 11.8, 36.0), (0.681, 459.0, 26.0, 13.8)]
@@ -28,10 +23,9 @@ def _piecewise_gaussian(w, lobes):
 
 def cct_from_xy(x, y):
     """Correlated color temperature (Kelvin) from CIE xy via McCamy's cubic
-    approximation. Only meaningful near the Planckian locus (roughly 2000-20000K) -
-    for strongly saturated/narrowband spectra (e.g. a single-color LED) the result is
-    numerically valid but physically meaningless, so the UI labels it "CCT (approx.)".
-    Returns None if the chromaticity is degenerate (y == 0.1858, division by zero)."""
+    approximation. Meaningful only near the Planckian locus (~2000-20000K); the UI
+    labels it "CCT (approx.)" because the number is valid but meaningless for
+    saturated/narrowband spectra. Returns None if y == 0.1858 (degenerate)."""
     denom = 0.1858 - y
     if abs(denom) < 1e-9:
         return None
@@ -72,22 +66,14 @@ class CalibrationSet:
     def _derive(self):
         if self._derived:
             return
-        self.wavelength = []
-        self.ciex = []
-        self.ciey = []
-        self.ciez = []
         c = self.wav_coef
-        for i in range(0, PIXELS):
-            self.wavelength.append(
-                c[0] + c[1] * i + c[2] * i ** 2 + c[3] * i ** 3 + c[4] * i ** 4 + c[5] * i ** 5)
-            w = self.wavelength[i]
-            self.ciex.append(_piecewise_gaussian(w, CIE_X_COEFS))
-            self.ciey.append(_piecewise_gaussian(w, CIE_Y_COEFS))
-            self.ciez.append(_piecewise_gaussian(w, CIE_Z_COEFS))
+        self.wavelength = [sum(c[k] * i ** k for k in range(6)) for i in range(PIXELS)]
+        self.ciex = [_piecewise_gaussian(w, CIE_X_COEFS) for w in self.wavelength]
+        self.ciey = [_piecewise_gaussian(w, CIE_Y_COEFS) for w in self.wavelength]
+        self.ciez = [_piecewise_gaussian(w, CIE_Z_COEFS) for w in self.wavelength]
 
-        self.wavelength_bins = []
-        for i in range(0, PIXELS - 1):
-            self.wavelength_bins.append(self.wavelength[i + 1] - self.wavelength[i])
+        self.wavelength_bins = [self.wavelength[i + 1] - self.wavelength[i]
+                                for i in range(PIXELS - 1)]
         self.wavelength_bins.append(self.wavelength[PIXELS - 1] - self.wavelength[PIXELS - 2])
         self._derived = True
 
@@ -115,8 +101,7 @@ class CalibrationSet:
 
     def chromaticity(self, flux):
         """Flux -> CIE 1931 (x, y) chromaticity, or None for a near-zero/dark reading.
-        Scale-invariant (no photometric 683 lm/W factor needed - that only matters for
-        luminance(), which stays absolute)."""
+        Scale-invariant (no 683 lm/W factor needed - that only matters for luminance())."""
         self._derive()
         X = Y = Z = 0.0
         for i in range(0, PIXELS):

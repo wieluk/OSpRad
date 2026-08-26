@@ -1,326 +1,376 @@
-# OSpRad 3.1.0
-# Released under GPL-3.0 license
-# https://github.com/troscianko/OSpRad
-#
-# Run this file to launch the app. Keep it in the same folder as serial_io.py,
-# calibration.py, plotting.py, datalog.py, analysis.py, calibration_wizard.py and
-# calibration_data.csv - measurements are written to data.csv beside them.
-# Requires OSpRad 3.x firmware on the Arduino Nano.
+# Run this file to launch the app. Requires OSpRad 3.x firmware on the Arduino Nano.
 
+import argparse
+import html
 import os
-import threading
+import shutil
+import sys
 import time
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, simpledialog
 
-from matplotlib.backends.backend_tkagg import NavigationToolbar2Tk
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QIcon, QPixmap, QTextCursor
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
+                               QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
+                               QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
+                               QPushButton, QScrollArea, QScroller, QScrollerProperties,
+                               QSizePolicy, QTabWidget, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
+
+from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 
 import analysis
 import calibration
 import datalog
 import plotting
 import serial_io
-from calibration_wizard import (CosineResponseTab, LinearisationTab, SensitivityTab,
-                                Tooltip, UnitSetupTab)
+import touch
+from _version import __version__
+from calibration_wizard import (CalibrationTransferTab, CosineResponseTab,
+                                LinearisationTab, SensitivityTab, UnitSetupTab, tip,
+                                wrapped_label)
 from monitor_calibration import MonitorCalibrationTab
+from qt_worker import Worker, wait_for
 
-try:
-    import sv_ttk
-except ImportError:
-    sv_ttk = None
-
-# Resolved against this folder rather than CWD so the app behaves the same however
-# it is launched (including from Pydroid 3 on Android).
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Where calibration_data.csv and data.csv live. Resolved against this file so the app
+# behaves the same however it is launched; see pyproject.toml for the py-modules layout
+# that motivates the per-user fallback below.
+if getattr(sys, 'frozen', False):
+    # __file__ points inside the PyInstaller bundle, which onefile deletes on exit.
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    _source_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.exists(os.path.join(_source_dir, 'calibration_data.csv')):
+        BASE_DIR = _source_dir
+    else:
+        # pip install: no CSV beside __file__, and site-packages is often not writable.
+        if sys.platform == 'win32':
+            _user_data_root = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        elif sys.platform == 'darwin':
+            _user_data_root = os.path.expanduser('~/Library/Application Support')
+        else:
+            _user_data_root = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+        BASE_DIR = os.path.join(_user_data_root, 'OSpRad')
+        os.makedirs(BASE_DIR, exist_ok=True)
 DATA_FILE = os.path.join(BASE_DIR, 'data.csv')
 CALIBRATION_FILE = os.path.join(BASE_DIR, 'calibration_data.csv')
 
-__version__ = '3.1.0'
+# First run: seed a writable calibration_data.csv from the read-only bundled copy.
+if not os.path.exists(CALIBRATION_FILE):
+    if getattr(sys, 'frozen', False):
+        _bundled_calibration = os.path.join(getattr(sys, '_MEIPASS', BASE_DIR), 'calibration_data.csv')
+        if os.path.exists(_bundled_calibration):
+            shutil.copy(_bundled_calibration, CALIBRATION_FILE)
+    else:
+        try:
+            from _calibration_data_bundled import CSV_TEXT as _bundled_csv_text
+        except ImportError:
+            _bundled_csv_text = None
+        if _bundled_csv_text is not None:
+            with open(CALIBRATION_FILE, 'w', newline='') as f:
+                f.write(_bundled_csv_text)
 
-PAD = 8
+# Cap on the scrolling log widget so an unattended "Repeat every (s)" session doesn't
+# grow unboundedly; QPlainTextEdit trims from the top past this.
+# First entry of the port combo; any other entry is a literal port name to connect to.
+PORT_AUTO = 'Auto-detect'
 
-# Cap on the scrolling log widget, so an unattended long "Repeat every (s)" session
-# doesn't grow its memory/redraw cost unboundedly.
 LOG_MAX_LINES = 500
-
-# 'debug' is extra-verbose wire-level detail - hidden by default but there for
-# diagnosing "what is the app actually sending" questions.
 LOG_LEVELS = ('debug', 'info', 'warning', 'error')
 LOG_LEVEL_RANK = {level: i for i, level in enumerate(LOG_LEVELS)}
+LOG_COLORS = {'error': '#d1495b', 'warning': '#e9a23a', 'debug': '#7a7a7a'}
+
+# Hand-rolled replacement for sv_ttk (Tkinter-only); "role" colours match the old styles.
+LIGHT_QSS = """
+QWidget { background-color: #fafafa; color: #1c1c1c; }
+QLineEdit, QPlainTextEdit, QTreeWidget, QComboBox { background-color: #ffffff; }
+QLabel[role="muted"] { color: #7a7a7a; }
+QLabel[role="good"] { color: #2a9d8f; }
+QLabel[role="bad"] { color: #d1495b; }
+"""
+DARK_QSS = """
+QWidget { background-color: #1c1c1c; color: #fafafa; }
+QLineEdit, QPlainTextEdit, QTreeWidget, QComboBox { background-color: #2b2b2b; color: #fafafa; }
+QLabel[role="muted"] { color: #9a9a9a; }
+QLabel[role="good"] { color: #2a9d8f; }
+QLabel[role="bad"] { color: #d1495b; }
+"""
 
 
-class OSpRadApp(tk.Tk):
-    def __init__(self):
+def _set_role(label, role):
+    label.setProperty('role', role)
+    label.style().unpolish(label)
+    label.style().polish(label)
+
+
+def _make_scroll_tab(content):
+    """Wrap a tab in a QScrollArea (so a tall tab scrolls instead of clipping) with
+    QScroller panning so a single-finger touch drag works on phone screens.
+
+    Vertical only. Tabs are laid out to fit the width, so any horizontal movement is
+    just drift - which takes both turning the scrollbar off (content is then sized to
+    the viewport width) and turning off QScroller's horizontal overshoot, since the
+    kinetic scroller rubber-bands sideways even with nothing to scroll to.
+    """
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    scroll.setWidget(content)
+
+    QScroller.grabGesture(scroll.viewport(), QScroller.ScrollerGestureType.TouchGesture)
+    scroller = QScroller.scroller(scroll.viewport())
+    props = scroller.scrollerProperties()
+    props.setScrollMetric(QScrollerProperties.ScrollMetric.HorizontalOvershootPolicy,
+                          QScrollerProperties.OvershootPolicy.OvershootAlwaysOff)
+    scroller.setScrollerProperties(props)
+    return scroll
+
+
+def _fit_width(widget):
+    """Let a widget be squeezed below its natural width instead of forcing the whole tab
+    wider than the screen. Used for the matplotlib toolbars, whose row of buttons is
+    wider than a phone in portrait."""
+    widget.setSizePolicy(QSizePolicy.Policy.Ignored, widget.sizePolicy().verticalPolicy())
+    return widget
+
+
+class OSpRadApp(QMainWindow):
+    def __init__(self, port=None):
         super().__init__()
-        self.title('OSpRad %s' % __version__)
+        self.setWindowTitle('OSpRad %s' % __version__)
         # Conservative small-phone-portrait floor; each tab also scrolls if its
-        # content is still taller than this (see _make_scrollable).
-        self.minsize(320, 480)
+        # content is still taller than this (see _make_scroll_tab).
+        self.setMinimumSize(320, 480)
 
-        self.dark_mode = tk.BooleanVar(value=False)
-        if sv_ttk:
-            sv_ttk.set_theme('light')
+        # Pre-selects the port combo built in _build_main_tab; None means auto-detect.
+        self._initial_port = port
 
+        self.dark_mode = False
         self.connection = None
         self.store = calibration.CalibrationStore(CALIBRATION_FILE)
         self.measurement = None
         self.reading = None
         self._last_luminance = None
-
-        self.save_label = tk.StringVar()
-        self.int_time = tk.StringVar(value='0')
-        self.min_scans = tk.StringVar(value='3')
-        self.max_scans = tk.StringVar(value='50')
-        self.repeat_time = tk.StringVar(value='300')
-        self.repeat_irr = tk.IntVar(value=1)
-        self.repeat_rad = tk.IntVar()
-        self.log_level = tk.StringVar(value='info')
         self._motor_test_angle = 30
 
         self._repeat_running = False
-        self._repeat_after_id = None
-        self._countdown_after_id = None
         self._repeat_next_time = None
 
         self._prev_int_time = None
         self._prev_scans = None
         self._compared_offsets = set()
-        self._scroll_canvases = []
-        self._active_scroll_canvas = None
+        self._connect_worker = None
+        self._connect_port = None
 
-        self._build_styles()
         self._build_ui()
+        self._apply_theme()
         self._load_saved_readings()
-        self._paint_background()
-        self.after(100, self._connect)
-
-    # ---------------- setup ----------------
-
-    def _paint_background(self):
-        """Match the window, scroll canvases, plot canvas and log widget to the theme.
-
-        Tk paints newly exposed areas with the toplevel's own background before the
-        layout catches up, so leaving it unset shows a bare rectangle during resize.
-        """
-        style = ttk.Style(self)
-        background = style.lookup('TFrame', 'background') or '#fafafa'
-        foreground = style.lookup('TLabel', 'foreground') or '#1c1c1c'
-        self.configure(background=background)
-        for canvas in self._scroll_canvases:
-            canvas.configure(background=background, highlightthickness=0)
-        if getattr(self, 'plot', None):
-            self.plot.widget.configure(background=background, highlightthickness=0, bd=0)
-        if getattr(self, 'history_plot', None):
-            self.history_plot.widget.configure(background=background, highlightthickness=0, bd=0)
-        if getattr(self, 'log_text', None):
-            self.log_text.configure(background=background, foreground=foreground,
-                                    insertbackground=foreground)
-
-    def _build_styles(self):
-        style = ttk.Style(self)
-        style.configure('Muted.TLabel', foreground='#7a7a7a')
-        style.configure('Good.TLabel', foreground='#2a9d8f')
-        style.configure('Bad.TLabel', foreground='#d1495b')
-        style.configure('Warn.TLabel', foreground='#e9a23a')
+        QTimer.singleShot(100, self._connect)
 
     def _build_ui(self):
-        self.columnconfigure(0, weight=1)
-        self.rowconfigure(0, weight=1)
+        tabs = QTabWidget()
+        self.setCentralWidget(tabs)
+        tabs.addTab(_make_scroll_tab(self._build_main_tab()), 'Main')
+        tabs.addTab(_make_scroll_tab(self._build_history_tab()), 'History')
+        tabs.addTab(_make_scroll_tab(self._build_monitor_cal_tab()), 'Monitor calibration')
+        tabs.addTab(_make_scroll_tab(self._build_calibration_tab()), 'Calibration')
+        tabs.addTab(_make_scroll_tab(self._build_debug_tab()), 'Debug')
 
-        notebook = ttk.Notebook(self)
-        notebook.grid(row=0, column=0, sticky='nsew')
-        notebook.add(self._build_main_tab(notebook), text='Main')
-        notebook.add(self._build_history_tab(notebook), text='History')
-        notebook.add(self._build_monitor_cal_tab(notebook), text='Monitor calibration')
-        notebook.add(self._build_calibration_tab(notebook), text='Calibration')
-        notebook.add(self._build_debug_tab(notebook), text='Debug')
+    def _apply_theme(self):
+        QApplication.instance().setStyleSheet(DARK_QSS if self.dark_mode else LIGHT_QSS)
+        self.plot.apply_theme(self.dark_mode)
+        self.history_plot.apply_theme(self.dark_mode)
 
-    def _make_scrollable(self, parent, expand_row=None):
-        """Wrap a canvas+scrollbar around a content frame so a tab taller than the
-        window scrolls instead of clipping (common on a short Android screen). If
-        expand_row is given, that row is stretched to fill the canvas height when the
-        canvas is taller than the content's natural size - so the Main tab's plot still
-        grows on a big desktop window, while the whole tab scrolls on a small one.
-        Returns (outer_frame, content_frame).
-        """
-        outer = ttk.Frame(parent)
-        outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(0, weight=1)
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        canvas.grid(row=0, column=0, sticky='nsew')
-        vbar = ttk.Scrollbar(outer, orient='vertical', command=canvas.yview)
-        vbar.grid(row=0, column=1, sticky='ns')
-        canvas.configure(yscrollcommand=vbar.set)
+    def _toggle_theme(self, checked):
+        self.dark_mode = checked
+        self._apply_theme()
 
-        content = ttk.Frame(canvas, padding=PAD)
-        content.columnconfigure(0, weight=1)
-        if expand_row is not None:
-            content.rowconfigure(expand_row, weight=1)
-        window_id = canvas.create_window((0, 0), window=content, anchor='nw')
+    def _build_main_tab(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
-        def on_content_configure(event):
-            canvas.configure(scrollregion=canvas.bbox('all'))
+        port_row = QHBoxLayout()
+        port_row.addWidget(QLabel('Port'))
+        self.port_combo = QComboBox()
+        tip(self.port_combo,
+            'Which serial port to connect to. Auto-detect finds the OSpRad by itself; '
+            'only pick one manually if that finds the wrong device.')
+        port_row.addWidget(self.port_combo, 1)
+        self.bt_refresh_ports = QPushButton('Refresh')
+        self.bt_refresh_ports.clicked.connect(self._refresh_ports)
+        port_row.addWidget(self.bt_refresh_ports)
+        layout.addLayout(port_row)
+        self._refresh_ports()
 
-        def on_canvas_configure(event):
-            height = max(event.height, content.winfo_reqheight())
-            canvas.itemconfig(window_id, width=event.width, height=height)
+        conn_row = QHBoxLayout()
+        self.conn_status_label = wrapped_label('Not connected.')
+        _set_role(self.conn_status_label, 'muted')
+        conn_row.addWidget(self.conn_status_label, 1)
+        self.bt_connect = QPushButton('Reconnect')
+        self.bt_connect.clicked.connect(self._connect)
+        conn_row.addWidget(self.bt_connect)
+        layout.addLayout(conn_row)
 
-        content.bind('<Configure>', on_content_configure)
-        canvas.bind('<Configure>', on_canvas_configure)
-        canvas.bind('<Enter>', lambda e: self._bind_mousewheel(canvas))
-        canvas.bind('<Leave>', lambda e: self._unbind_mousewheel())
-        self._scroll_canvases.append(canvas)
-        return outer, content
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        layout.addWidget(separator)
 
-    # ---------------- Main tab ----------------
+        self.bt_rad = QPushButton('Radiance')
+        self.bt_rad.setMinimumHeight(36)
+        self.bt_rad.setEnabled(False)
+        self.bt_rad.clicked.connect(lambda: self._measure('r'))
+        layout.addWidget(self.bt_rad)
 
-    def _build_main_tab(self, parent):
-        outer, content = self._make_scrollable(parent, expand_row=10)
+        self.bt_irr = QPushButton('Irradiance')
+        self.bt_irr.setMinimumHeight(36)
+        self.bt_irr.setEnabled(False)
+        self.bt_irr.clicked.connect(lambda: self._measure('i'))
+        layout.addWidget(self.bt_irr)
 
-        conn_row = ttk.Frame(content)
-        conn_row.grid(row=0, column=0, sticky='ew')
-        conn_row.columnconfigure(0, weight=1)
-        self.conn_status_label = ttk.Label(conn_row, text='Not connected.',
-                                           style='Muted.TLabel', wraplength=300)
-        self.conn_status_label.grid(row=0, column=0, sticky='w')
-        self.bt_connect = ttk.Button(conn_row, text='Reconnect', command=self._connect, width=10)
-        self.bt_connect.grid(row=0, column=1, sticky='e')
+        self.bt_save = QPushButton('Save reading')
+        self.bt_save.setMinimumHeight(36)
+        self.bt_save.clicked.connect(self._on_save_clicked)
+        tip(self.bt_save, 'Save the current reading to the history, under the label below.')
+        layout.addWidget(self.bt_save)
 
-        ttk.Separator(content).grid(row=1, column=0, sticky='ew', pady=PAD)
+        layout.addWidget(QLabel('Label'))
+        self.save_label_edit = QLineEdit()
+        # Typing a label clears a "needs a label" complaint without needing another press.
+        self.save_label_edit.textChanged.connect(lambda _: self._set_save_error(''))
+        layout.addWidget(self.save_label_edit)
 
-        self.bt_rad = ttk.Button(content, text='Radiance', command=lambda: self._measure('r'))
-        self.bt_rad.grid(row=2, column=0, sticky='ew', pady=(0, PAD // 2), ipady=6)
+        # Inline rather than a dialog: a modal on a phone hides the very field it is
+        # complaining about, and this sits directly under the control that failed.
+        self.save_error_label = wrapped_label('')
+        _set_role(self.save_error_label, 'bad')
+        self.save_error_label.setVisible(False)
+        layout.addWidget(self.save_error_label)
 
-        self.bt_irr = ttk.Button(content, text='Irradiance', command=lambda: self._measure('i'))
-        self.bt_irr.grid(row=3, column=0, sticky='ew', pady=PAD // 2, ipady=6)
+        self._refresh_save_button()
 
-        self.bt_save = ttk.Button(content, text='Save reading', command=self._save, state='disabled')
-        self.bt_save.grid(row=4, column=0, sticky='ew', pady=PAD // 2, ipady=6)
+        settings = QGridLayout()
+        settings.setColumnStretch(2, 1)
 
-        ttk.Label(content, text='Label').grid(row=5, column=0, sticky='w', pady=(PAD, 2))
-        ttk.Entry(content, textvariable=self.save_label).grid(row=6, column=0, sticky='ew')
+        int_time_label = QLabel('Integration time (ms), 0 = auto')
+        self.int_time_edit = QLineEdit('0')
+        self.int_time_edit.setFixedWidth(70)
+        int_time_tip = ('Per-scan exposure in milliseconds. 0 (default) lets the firmware '
+                        'auto-expose just below saturation; set a fixed value only when '
+                        'repeated measurements need identical exposure.')
+        tip(int_time_label, int_time_tip)
+        tip(self.int_time_edit, int_time_tip)
+        settings.addWidget(int_time_label, 0, 0)
+        settings.addWidget(self.int_time_edit, 0, 1)
 
-        # Stretch weight on column 2 (past the input) rather than column 1 (between
-        # label and input) so the label+input pair stays packed on the left.
-        settings = ttk.Frame(content)
-        settings.grid(row=7, column=0, sticky='ew', pady=(PAD, 0))
-        settings.columnconfigure(2, weight=1)
+        scans_label = QLabel('Scans, min / max')
+        tip(scans_label, 'placeholder')  # overwritten below once scans_tip is defined
+        scans_row = QHBoxLayout()
+        self.min_scans_edit = QLineEdit('3')
+        self.min_scans_edit.setFixedWidth(45)
+        self.max_scans_edit = QLineEdit('50')
+        self.max_scans_edit.setFixedWidth(45)
+        scans_row.addWidget(self.min_scans_edit)
+        scans_row.addWidget(QLabel('/'))
+        scans_row.addWidget(self.max_scans_edit)
+        scans_row.addStretch(1)
+        scans_tip = ('How many scans the firmware averages into one measurement. The firmware '
+                     'picks a value in this range itself - short exposures need more repeats '
+                     'to fill ~1s of total sampling time.')
+        tip(scans_label, scans_tip)
+        tip(self.min_scans_edit, scans_tip)
+        tip(self.max_scans_edit, scans_tip)
+        settings.addWidget(scans_label, 1, 0)
+        settings.addLayout(scans_row, 1, 1)
+        layout.addLayout(settings)
 
-        int_time_label = ttk.Label(settings, text='Integration time (ms), 0 = auto')
-        int_time_label.grid(row=0, column=0, sticky='w')
-        int_time_entry = ttk.Entry(settings, textvariable=self.int_time, width=8)
-        int_time_entry.grid(row=0, column=1, sticky='w', padx=(PAD, 0))
-        int_time_tip = ('How long each scan collects light for. Leave at 0 to let the '
-                        'firmware pick automatically by ramping up exposure until just '
-                        'below saturation (recommended). Set a fixed value only if you '
-                        'need identical exposure across repeated measurements.')
-        Tooltip(int_time_label, int_time_tip)
-        Tooltip(int_time_entry, int_time_tip)
+        repeat_box = QGroupBox('Automatic repeat')
+        repeat_layout = QVBoxLayout(repeat_box)
 
-        scans_label = ttk.Label(settings, text='Scans, min / max')
-        scans_label.grid(row=1, column=0, sticky='w', pady=(6, 0))
-        scans = ttk.Frame(settings)
-        scans.grid(row=1, column=1, sticky='w', padx=(PAD, 0), pady=(6, 0))
-        ttk.Entry(scans, textvariable=self.min_scans, width=5).grid(row=0, column=0)
-        ttk.Label(scans, text='/').grid(row=0, column=1, padx=4)
-        ttk.Entry(scans, textvariable=self.max_scans, width=5).grid(row=0, column=2)
-        scans_tip = ('How many repeat scans to average into one measurement. More scans '
-                    'reduce noise but take longer. The firmware picks a value in this '
-                    'range on its own (short exposures need more repeats to fill about '
-                    'a second of total sampling time).')
-        Tooltip(scans_label, scans_tip)
-        Tooltip(scans, scans_tip)
+        repeat_row = QHBoxLayout()
+        repeat_row.addWidget(QLabel('Repeat every (s)'))
+        self.repeat_time_edit = QLineEdit('300')
+        self.repeat_time_edit.setFixedWidth(60)
+        tip(self.repeat_time_edit, 'Seconds between automatic measurements; the mode(s) '
+                                   'measured each time come from the checkboxes below.')
+        repeat_row.addWidget(self.repeat_time_edit)
+        self.bt_repeat_start = QPushButton('Start')
+        self.bt_repeat_start.setEnabled(False)
+        self.bt_repeat_start.clicked.connect(self._start_repeat)
+        tip(self.bt_repeat_start, 'Start automatically taking and saving measurements '
+                                  'on the interval set above.')
+        repeat_row.addWidget(self.bt_repeat_start)
+        self.bt_repeat_stop = QPushButton('Stop')
+        self.bt_repeat_stop.setEnabled(False)
+        self.bt_repeat_stop.clicked.connect(self._stop_repeat)
+        tip(self.bt_repeat_stop, 'Stop automatic repeat.')
+        repeat_row.addWidget(self.bt_repeat_stop)
+        repeat_row.addStretch(1)
+        repeat_layout.addLayout(repeat_row)
 
-        repeat_box = ttk.LabelFrame(content, text='Automatic repeat', padding=PAD)
-        repeat_box.grid(row=8, column=0, sticky='ew', pady=(PAD, 0))
-        repeat_box.columnconfigure(3, weight=1)
+        self.repeat_status_label = QLabel('Not running.')
+        _set_role(self.repeat_status_label, 'muted')
+        repeat_layout.addWidget(self.repeat_status_label)
 
-        ttk.Label(repeat_box, text='Repeat every (s)').grid(row=0, column=0, sticky='w')
-        repeat_entry = ttk.Entry(repeat_box, textvariable=self.repeat_time, width=6)
-        repeat_entry.grid(row=0, column=1, sticky='w', padx=(PAD, 0))
-        repeat_tip = ('How many seconds to wait between automatic measurements once '
-                     'started. Which mode(s) get measured each time is set by the '
-                     'checkboxes below.')
-        Tooltip(repeat_entry, repeat_tip)
+        # Indented under the row above; checkboxes only do anything while repeat is running.
+        repeat_modes = QHBoxLayout()
+        repeat_modes.setContentsMargins(20, 0, 0, 0)
+        measure_label = QLabel('Measure:')
+        _set_role(measure_label, 'muted')
+        repeat_modes.addWidget(measure_label)
+        self.repeat_irr_check = QCheckBox('Irradiance')
+        self.repeat_irr_check.setChecked(True)
+        tip(self.repeat_irr_check, 'Take an Irradiance reading on each automatic repeat.')
+        repeat_modes.addWidget(self.repeat_irr_check)
+        self.repeat_rad_check = QCheckBox('Radiance')
+        tip(self.repeat_rad_check, 'Take a Radiance reading on each automatic repeat.')
+        repeat_modes.addWidget(self.repeat_rad_check)
+        repeat_modes.addStretch(1)
+        repeat_layout.addLayout(repeat_modes)
 
-        btn_row = ttk.Frame(repeat_box)
-        btn_row.grid(row=0, column=2, sticky='w', padx=(PAD, 0))
-        self.bt_repeat_start = ttk.Button(btn_row, text='Start', width=7,
-                                          command=self._start_repeat, state='disabled')
-        self.bt_repeat_start.grid(row=0, column=0)
-        self.bt_repeat_stop = ttk.Button(btn_row, text='Stop', width=7,
-                                         command=self._stop_repeat, state='disabled')
-        self.bt_repeat_stop.grid(row=0, column=1, padx=(6, 0))
-        Tooltip(self.bt_repeat_start, 'Start automatically taking and saving measurements '
-                                      'on the interval set above.')
-        Tooltip(self.bt_repeat_stop, 'Stop automatic repeat.')
+        layout.addWidget(repeat_box)
+        layout.addWidget(self._build_analysis())
 
-        self.repeat_status_label = ttk.Label(repeat_box, text='Not running.', style='Muted.TLabel')
-        self.repeat_status_label.grid(row=1, column=0, columnspan=4, sticky='w', pady=(6, 0))
+        self.cursor_label = QLabel('')
+        _set_role(self.cursor_label, 'muted')
 
-        # Indented under the row above with a "Measure:" prefix, so it reads as part of
-        # the repeat feature (these checkboxes have no effect unless repeat is running).
-        repeat_modes = ttk.Frame(repeat_box)
-        repeat_modes.grid(row=2, column=0, columnspan=4, sticky='w', pady=(6, 0), padx=(20, 0))
-        ttk.Label(repeat_modes, text='Measure:', style='Muted.TLabel').grid(row=0, column=0)
-        cb_repeat_irr = ttk.Checkbutton(repeat_modes, text='Irradiance', variable=self.repeat_irr)
-        cb_repeat_irr.grid(row=0, column=1, padx=(6, 0))
-        cb_repeat_rad = ttk.Checkbutton(repeat_modes, text='Radiance', variable=self.repeat_rad)
-        cb_repeat_rad.grid(row=0, column=2, padx=(10, 0))
-        Tooltip(cb_repeat_irr, 'Take an Irradiance reading on each automatic repeat.')
-        Tooltip(cb_repeat_rad, 'Take a Radiance reading on each automatic repeat.')
+        self.plot = plotting.SpectrumPlot(dark=self.dark_mode)
+        self.plot.on_hover = lambda text: self.cursor_label.setText(text or '')
+        plot_layout = QVBoxLayout()
+        toolbar = _fit_width(NavigationToolbar2QT(self.plot.canvas, content))
+        plot_layout.addWidget(toolbar)
+        plot_layout.addWidget(self.cursor_label)
+        plot_layout.addWidget(self.plot.canvas, 1)
+        layout.addLayout(plot_layout, 1)
 
-        self._build_analysis(content).grid(row=9, column=0, sticky='ew', pady=(PAD, 0))
+        actions = QHBoxLayout()
+        self.dark_mode_check = QCheckBox('Dark mode')
+        self.dark_mode_check.toggled.connect(self._toggle_theme)
+        actions.addWidget(self.dark_mode_check)
+        actions.addStretch(1)
+        save_fig_btn = QPushButton('Save figure...')
+        save_fig_btn.clicked.connect(self._save_figure)
+        actions.addWidget(save_fig_btn)
+        layout.addLayout(actions)
 
-        plot_frame = ttk.Frame(content)
-        plot_frame.grid(row=10, column=0, sticky='nsew', pady=(PAD, 0))
-        plot_frame.columnconfigure(0, weight=1)
-        plot_frame.rowconfigure(2, weight=1)
+        return content
 
-        self.plot = plotting.SpectrumPlot(plot_frame, dark=self.dark_mode.get())
-        self.plot.on_hover = lambda text: self.cursor_label.config(text=text or '')
-
-        toolbar = NavigationToolbar2Tk(self.plot.canvas, plot_frame, pack_toolbar=False)
-        toolbar.update()
-        toolbar.grid(row=0, column=0, sticky='ew')
-
-        self.cursor_label = ttk.Label(plot_frame, text='', style='Muted.TLabel')
-        self.cursor_label.grid(row=1, column=0, sticky='w')
-
-        self.plot.widget.grid(row=2, column=0, sticky='nsew')
-
-        actions = ttk.Frame(content)
-        actions.grid(row=11, column=0, sticky='ew', pady=(PAD, 0))
-        actions.columnconfigure(0, weight=1)
-        ttk.Button(actions, text='Save figure...', command=self._save_figure).grid(
-            row=0, column=1, sticky='e')
-        ttk.Checkbutton(actions, text='Dark mode', variable=self.dark_mode,
-                        command=self._toggle_theme).grid(row=0, column=0, sticky='w')
-
-        return outer
-
-    def _build_analysis(self, parent):
-        frame = ttk.LabelFrame(parent, text='Analysis', padding=PAD)
-        frame.columnconfigure(1, weight=1)
-        frame.columnconfigure(3, weight=1)
+    def _build_analysis(self):
+        group = QGroupBox('Analysis')
+        grid = QGridLayout(group)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
 
         tips = {
-            'peak': 'Wavelength with the highest measured intensity. Daylight and white '
-                   'LEDs usually peak around 450-550nm; incandescent bulbs peak further '
-                   'into the red, often above 600nm.',
-            'fwhm': 'Width of the main peak at half its height. Narrow (a few nm) means a '
-                   'single LED or laser line; broad, or "n/a", means a continuous/broadband '
-                   'source like daylight or an incandescent bulb.',
-            'cie_x': 'CIE 1931 chromaticity x - perceived colour, independent of '
-                    'brightness, paired with CIE y below. Daylight is around (0.31, 0.33); '
-                    'warm incandescent light is around (0.45, 0.41).',
-            'cie_y': 'CIE 1931 chromaticity y - perceived colour, independent of '
-                    'brightness, paired with CIE x above. Daylight is around (0.31, 0.33); '
-                    'warm incandescent light is around (0.45, 0.41).',
-            'cct': 'Correlated Colour Temperature - approximate "warmth" in Kelvin. Lower '
-                  '(~2700K) reads warm/orange, like incandescent; higher (~5000-6500K) '
-                  'reads cool/blue, like daylight. Shows "-" for narrow-band/coloured '
-                  'light, where CCT isn\'t a meaningful concept.',
+            'peak': 'Wavelength of the highest intensity. Daylight/white LEDs peak around '
+                    '450-550nm; incandescent bulbs peak further into the red, often >600nm.',
+            'fwhm': 'Width of the main peak at half height. A few nm = single LED/laser line; '
+                    'broad or "n/a" = broadband source like daylight or an incandescent bulb.',
+            'cie_x': 'CIE 1931 chromaticity x (perceived colour, brightness-independent). '
+                    'Daylight ~ (0.31, 0.33); warm incandescent ~ (0.45, 0.41).',
+            'cie_y': 'CIE 1931 chromaticity y - see cie_x above.',
+            'cct': 'Approximate "warmth" in Kelvin. ~2700K = warm/orange (incandescent); '
+                   '~5000-6500K = cool/blue (daylight). Shows "-" for narrow-band light, '
+                   'where CCT is meaningless.',
         }
 
         self._analysis_labels = {}
@@ -328,236 +378,204 @@ class OSpRadApp(tk.Tk):
                   ('cie_x', 'CIE x'), ('cie_y', 'CIE y'), ('cct', 'CCT (approx.)'))
         for i, (key, caption) in enumerate(fields):
             r, c = divmod(i, 2)
-            caption_label = ttk.Label(frame, text=caption + ':', style='Muted.TLabel')
-            caption_label.grid(row=r, column=c * 2, sticky='w',
-                               padx=(0 if c == 0 else PAD, 4), pady=(2, 0))
-            value = ttk.Label(frame, text='-')
-            value.grid(row=r, column=c * 2 + 1, sticky='w', pady=(2, 0))
+            caption_label = QLabel(caption + ':')
+            _set_role(caption_label, 'muted')
+            grid.addWidget(caption_label, r, c * 2)
+            value = QLabel('-')
+            grid.addWidget(value, r, c * 2 + 1)
             self._analysis_labels[key] = value
-            Tooltip(caption_label, tips[key])
-            Tooltip(value, tips[key])
+            tip(caption_label, tips[key])
+            tip(value, tips[key])
 
-        return frame
+        return group
 
-    # ---------------- History tab ----------------
+    def _build_history_tab(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
-    def _build_history_tab(self, parent):
-        outer, content = self._make_scrollable(parent, expand_row=3)
+        header = QHBoxLayout()
+        saved_label = QLabel('Saved readings')
+        _set_role(saved_label, 'muted')
+        header.addWidget(saved_label, 1)
+        clear_btn = QPushButton('Clear comparison')
+        clear_btn.clicked.connect(self._clear_history_plot)
+        header.addWidget(clear_btn)
+        layout.addLayout(header)
 
-        header = ttk.Frame(content)
-        header.grid(row=0, column=0, sticky='ew')
-        header.columnconfigure(0, weight=1)
-        ttk.Label(header, text='Saved readings', style='Muted.TLabel').grid(
-            row=0, column=0, sticky='w')
-        ttk.Button(header, text='Clear comparison', command=self._clear_history_plot).grid(
-            row=0, column=1, sticky='e')
+        self.saved_tree = QTreeWidget()
+        self.saved_tree.setHeaderLabels(['Time', 'Label', 'Mode', 'Lux/cd·m²'])
+        self.saved_tree.setRootIsDecorated(False)
+        self.saved_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
+        self.saved_tree.setMaximumHeight(220)
+        self.saved_tree.itemDoubleClicked.connect(self._on_saved_double_click)
+        self.saved_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.saved_tree.customContextMenuRequested.connect(self._on_saved_context_menu)
+        # There is no right button on a phone, so a long press raises the same menu.
+        # Held on the viewport, which is what customContextMenuRequested reports against.
+        self._tree_long_press = touch.install_long_press(
+            self.saved_tree.viewport(), self._on_saved_context_menu)
+        layout.addWidget(self.saved_tree)
 
-        tree_frame = ttk.Frame(content)
-        tree_frame.grid(row=1, column=0, sticky='ew', pady=(4, 0))
-        tree_frame.columnconfigure(0, weight=1)
-        tree_frame.rowconfigure(0, weight=1)
+        layout.addWidget(wrapped_label(
+            'Double-click (or double-tap) a reading to add it to the comparison plot '
+            'below; again to remove it. Right-click - or press and hold on a touchscreen '
+            '- for more options, including on a multi-selection.'))
 
-        self.saved_tree = ttk.Treeview(
-            tree_frame, columns=('time', 'label', 'mode', 'luminance'),
-            show='headings', height=8, selectmode='extended')
-        for col, text, width in (('time', 'Time', 65), ('label', 'Label', 130),
-                                  ('mode', 'Mode', 50), ('luminance', 'Lux/cd·m²', 90)):
-            self.saved_tree.heading(col, text=text)
-            self.saved_tree.column(col, width=width, anchor='w')
-        self.saved_tree.grid(row=0, column=0, sticky='nsew')
-        tree_scroll = ttk.Scrollbar(tree_frame, orient='vertical', command=self.saved_tree.yview)
-        tree_scroll.grid(row=0, column=1, sticky='ns')
-        self.saved_tree.configure(yscrollcommand=tree_scroll.set)
-        self.saved_tree.bind('<Double-1>', self._on_saved_double_click)
-        self.saved_tree.bind('<Button-3>', self._on_saved_right_click)
+        self.history_plot = plotting.SpectrumPlot(dark=self.dark_mode)
+        plot_layout = QVBoxLayout()
+        toolbar = _fit_width(NavigationToolbar2QT(self.history_plot.canvas, content))
+        plot_layout.addWidget(toolbar)
+        plot_layout.addWidget(self.history_plot.canvas, 1)
+        layout.addLayout(plot_layout, 1)
 
-        ttk.Label(content, text='Double-click a reading to add it to the comparison plot '
-                                'below; double-click it again to remove it. Double-click '
-                                'more than one to compare them. Right-click for more '
-                                'options, including on a multi-selection.',
-                 style='Muted.TLabel', wraplength=500, justify='left').grid(
-            row=2, column=0, sticky='w', pady=(6, 0))
+        return content
 
-        plot_frame = ttk.Frame(content)
-        plot_frame.grid(row=3, column=0, sticky='nsew', pady=(PAD, 0))
-        plot_frame.columnconfigure(0, weight=1)
-        plot_frame.rowconfigure(1, weight=1)
+    # Monitor calibration is a downstream USE of an already-calibrated device, blocked by
+    # MonitorCalibrationTab._start() until the unit is set up - hence a top-level tab.
 
-        self.history_plot = plotting.SpectrumPlot(plot_frame, dark=self.dark_mode.get())
-        toolbar = NavigationToolbar2Tk(self.history_plot.canvas, plot_frame, pack_toolbar=False)
-        toolbar.update()
-        toolbar.grid(row=0, column=0, sticky='ew')
-        self.history_plot.widget.grid(row=1, column=0, sticky='nsew')
-
-        return outer
+    def _build_monitor_cal_tab(self):
+        self.monitor_cal_tab = MonitorCalibrationTab(self.connection, self.store)
+        return self.monitor_cal_tab
 
     # ---------------- Calibration tab ----------------
 
-    def _build_calibration_tab(self, parent):
-        outer, content = self._make_scrollable(parent, expand_row=1)
+    def _build_calibration_tab(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.addWidget(wrapped_label(
+            'One-time setup per unit. Unit number and wheel positions live on the Arduino; '
+            'linearisation and spectral sensitivity live in calibration_data.csv.'))
 
-        ttk.Label(content, style='Muted.TLabel', wraplength=560, justify='left', text=(
-            'One-time setup per unit. Unit number and wheel positions live on the Arduino '
-            'itself; linearisation and spectral sensitivity are stored in '
-            'calibration_data.csv.')).grid(row=0, column=0, sticky='w')
+        cal_tabs = QTabWidget()
+        self.unit_setup_tab = UnitSetupTab(self.connection)
+        self.linearisation_tab = LinearisationTab(self.connection, self.store)
+        self.sensitivity_tab = SensitivityTab(self.connection, self.store)
+        self.cosine_tab = CosineResponseTab(self.connection, self.store)
+        self.transfer_tab = CalibrationTransferTab(self.connection, self.store, self._log)
+        cal_tabs.addTab(self.unit_setup_tab, 'Unit & wheel setup')
+        cal_tabs.addTab(self.linearisation_tab, 'Linearisation')
+        cal_tabs.addTab(self.sensitivity_tab, 'Spectral sensitivity')
+        cal_tabs.addTab(self.cosine_tab, 'Cosine response')
+        cal_tabs.addTab(self.transfer_tab, 'Import & export')
+        layout.addWidget(cal_tabs, 1)
 
-        cal_notebook = ttk.Notebook(content)
-        cal_notebook.grid(row=1, column=0, sticky='nsew', pady=(PAD, 0))
-        self.unit_setup_tab = UnitSetupTab(cal_notebook, self.connection)
-        self.linearisation_tab = LinearisationTab(cal_notebook, self.connection, self.store)
-        self.sensitivity_tab = SensitivityTab(cal_notebook, self.connection, self.store)
-        self.cosine_tab = CosineResponseTab(cal_notebook, self.connection, self.store)
-        cal_notebook.add(self.unit_setup_tab, text='Unit & wheel setup')
-        cal_notebook.add(self.linearisation_tab, text='Linearisation')
-        cal_notebook.add(self.sensitivity_tab, text='Spectral sensitivity')
-        cal_notebook.add(self.cosine_tab, text='Cosine response')
+        return content
 
-        return outer
+    def _build_debug_tab(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
-    # ---------------- Monitor calibration tab ----------------
-    # Separate top-level tab, not nested under Calibration: this is a downstream USE of
-    # an already-calibrated device (monitor measurement), and is blocked outright by
-    # MonitorCalibrationTab._start() if the device isn't calibrated.
+        components = QGroupBox('Components')
+        comp_layout = QVBoxLayout(components)
+        self.debug_status_label = wrapped_label('Not connected.')
+        comp_layout.addWidget(self.debug_status_label)
 
-    def _build_monitor_cal_tab(self, parent):
-        outer, content = self._make_scrollable(parent, expand_row=0)
-        self.monitor_cal_tab = MonitorCalibrationTab(content, self.connection, self.store)
-        self.monitor_cal_tab.grid(row=0, column=0, sticky='nsew')
-        return outer
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        comp_layout.addWidget(separator)
 
-    # ---------------- Debug tab ----------------
+        self.sensor_verdict_label = QLabel('? Optical sensor: unknown')
+        _set_role(self.sensor_verdict_label, 'muted')
+        comp_layout.addWidget(self.sensor_verdict_label)
+        self.sensor_detail_label = QLabel('')
+        _set_role(self.sensor_detail_label, 'muted')
+        comp_layout.addWidget(self.sensor_detail_label)
 
-    def _build_debug_tab(self, parent):
-        outer, content = self._make_scrollable(parent, expand_row=2)
+        motor_row = QHBoxLayout()
+        motor_row.addWidget(QLabel('Filter wheel motor'), 1)
+        self.bt_motor_test = QPushButton('Test')
+        self.bt_motor_test.setEnabled(False)
+        self.bt_motor_test.clicked.connect(self._test_motor)
+        motor_row.addWidget(self.bt_motor_test)
+        comp_layout.addLayout(motor_row)
+        layout.addWidget(components)
 
-        components = ttk.LabelFrame(content, text='Components', padding=PAD)
-        components.grid(row=0, column=0, sticky='ew')
-        components.columnconfigure(0, weight=1)
+        log_header = QHBoxLayout()
+        log_label = QLabel('Log')
+        _set_role(log_label, 'muted')
+        log_header.addWidget(log_label, 1)
+        level_label = QLabel('Level')
+        _set_role(level_label, 'muted')
+        log_header.addWidget(level_label)
+        self.log_level_combo = QComboBox()
+        self.log_level_combo.addItems(LOG_LEVELS)
+        self.log_level_combo.setCurrentText('info')
+        log_header.addWidget(self.log_level_combo)
+        layout.addLayout(log_header)
 
-        self.debug_status_label = ttk.Label(components, text='Not connected.',
-                                            justify='left', wraplength=540)
-        self.debug_status_label.grid(row=0, column=0, sticky='w')
+        self.log_text = QPlainTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumBlockCount(LOG_MAX_LINES)
+        layout.addWidget(self.log_text, 1)
 
-        ttk.Separator(components).grid(row=1, column=0, sticky='ew', pady=(PAD, PAD // 2))
+        return content
 
-        self.sensor_verdict_label = ttk.Label(components, text='? Optical sensor: unknown',
-                                              style='Muted.TLabel')
-        self.sensor_verdict_label.grid(row=2, column=0, sticky='w')
-        self.sensor_detail_label = ttk.Label(components, text='', style='Muted.TLabel')
-        self.sensor_detail_label.grid(row=3, column=0, sticky='w', pady=(0, PAD // 2))
+    def _refresh_ports(self):
+        """Repopulate the port combo from a fresh scan, keeping the current selection even
+        if this scan doesn't see it - the device may just be momentarily unplugged."""
+        keep = self.port_combo.currentText() if self.port_combo.count() else \
+            (self._initial_port or PORT_AUTO)
+        self.port_combo.blockSignals(True)
+        self.port_combo.clear()
+        self.port_combo.addItem(PORT_AUTO)
+        ports = serial_io.list_ports()
+        self.port_combo.addItems(ports)
+        if keep != PORT_AUTO and keep not in ports:
+            self.port_combo.addItem(keep)
+        idx = self.port_combo.findText(keep)
+        self.port_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.port_combo.blockSignals(False)
 
-        motor_row = ttk.Frame(components)
-        motor_row.grid(row=4, column=0, sticky='ew')
-        motor_row.columnconfigure(0, weight=1)
-        ttk.Label(motor_row, text='Filter wheel motor').grid(row=0, column=0, sticky='w')
-        self.bt_motor_test = ttk.Button(motor_row, text='Test', command=self._test_motor,
-                                        state='disabled', width=8)
-        self.bt_motor_test.grid(row=0, column=1, sticky='e')
-
-        log_header = ttk.Frame(content)
-        log_header.grid(row=1, column=0, sticky='ew', pady=(PAD, 0))
-        log_header.columnconfigure(0, weight=1)
-        ttk.Label(log_header, text='Log', style='Muted.TLabel').grid(row=0, column=0, sticky='w')
-        ttk.Label(log_header, text='Level', style='Muted.TLabel').grid(row=0, column=1, sticky='e')
-        level_box = ttk.Combobox(log_header, textvariable=self.log_level, values=LOG_LEVELS,
-                                 state='readonly', width=8)
-        level_box.grid(row=0, column=2, sticky='e', padx=(4, 0))
-
-        self._build_log(content).grid(row=2, column=0, sticky='nsew', pady=(2, 0))
-
-        return outer
-
-    def _build_log(self, parent):
-        log_frame = ttk.Frame(parent)
-        log_frame.columnconfigure(0, weight=1)
-        log_frame.rowconfigure(0, weight=1)
-        self.log_text = tk.Text(log_frame, height=10, wrap='word', state='disabled',
-                                borderwidth=0, highlightthickness=0)
-        self.log_text.grid(row=0, column=0, sticky='nsew')
-        log_scroll = ttk.Scrollbar(log_frame, orient='vertical', command=self.log_text.yview)
-        log_scroll.grid(row=0, column=1, sticky='ns')
-        self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.tag_configure('error', foreground='#d1495b')
-        self.log_text.tag_configure('warning', foreground='#e9a23a')
-        self.log_text.tag_configure('debug', foreground='#7a7a7a')
-        return log_frame
-
-    # ---------------- scrolling ----------------
-
-    def _bind_mousewheel(self, canvas):
-        self._active_scroll_canvas = canvas
-        canvas.bind_all('<MouseWheel>', self._on_mousewheel)
-        canvas.bind_all('<Button-4>', self._on_mousewheel)
-        canvas.bind_all('<Button-5>', self._on_mousewheel)
-
-    def _unbind_mousewheel(self):
-        if self._active_scroll_canvas is not None:
-            self._active_scroll_canvas.unbind_all('<MouseWheel>')
-            self._active_scroll_canvas.unbind_all('<Button-4>')
-            self._active_scroll_canvas.unbind_all('<Button-5>')
-        self._active_scroll_canvas = None
-
-    def _on_mousewheel(self, event):
-        canvas = self._active_scroll_canvas
-        if canvas is None:
-            return
-        if event.num == 4:
-            canvas.yview_scroll(-1, 'units')
-        elif event.num == 5:
-            canvas.yview_scroll(1, 'units')
-        else:
-            canvas.yview_scroll(-1 if event.delta > 0 else 1, 'units')
-
-    # ---------------- connection ----------------
+    def _selected_port(self):
+        text = self.port_combo.currentText()
+        return None if text == PORT_AUTO else text
 
     def _connect(self):
-        # Runs off the main thread; opening the port and waiting for the firmware
-        # reply can take several seconds, and blocking the main thread would freeze
-        # the UI including the log that's supposed to show progress.
+        # Runs on a background QThread (qt_worker.Worker); blocking the main thread
+        # would freeze the UI including the log that's supposed to show progress.
         self.connection = None
         self._set_connected(False)
         self._propagate_connection()
-        self.bt_connect['state'] = 'disabled'
-        self.bt_connect['text'] = 'Connecting...'
-        self.title('OSpRad %s' % __version__)
+        self.bt_connect.setEnabled(False)
+        self.bt_connect.setText('Connecting...')
+        self.setWindowTitle('OSpRad %s' % __version__)
         self._log('Connecting...')
         self._update_conn_labels('Connecting...')
-        self.sensor_verdict_label.config(text='? Optical sensor: unknown', style='Muted.TLabel')
-        self.sensor_detail_label.config(text='')
-        self.update_idletasks()
+        self.sensor_verdict_label.setText('? Optical sensor: unknown')
+        _set_role(self.sensor_verdict_label, 'muted')
+        self.sensor_detail_label.setText('')
 
-        threading.Thread(target=self._connect_worker, daemon=True).start()
+        # Rescan for new devices; read here since the worker thread can't touch widgets.
+        self._refresh_ports()
+        self._connect_port = self._selected_port()
 
-    def _connect_worker(self):
-        try:
-            self.store.load()
-        except calibration.CalibrationError as exc:
-            self.after(0, self._connect_failed, str(exc))
-            return
-        try:
-            connection = serial_io.SerialConnection()
-            config = connection.check_firmware()
-        except serial_io.SpecError as exc:
-            self.after(0, self._connect_failed, str(exc))
-            return
-        self.after(0, self._connect_succeeded, connection, config)
+        self._connect_worker = Worker(self._do_connect)
+        self._connect_worker.succeeded.connect(self._connect_succeeded)
+        self._connect_worker.failed.connect(self._connect_failed)
+        self._connect_worker.start()
+
+    def _do_connect(self):
+        self.store.load()
+        connection = serial_io.SerialConnection(port=self._connect_port)
+        config = connection.check_firmware()
+        return connection, config
 
     def _connect_failed(self, message):
-        self.bt_connect['state'] = 'normal'
-        self.bt_connect['text'] = 'Reconnect'
+        self.bt_connect.setEnabled(True)
+        self.bt_connect.setText('Reconnect')
         self._log(message, level='error')
         self._update_conn_labels(message)
 
-    def _connect_succeeded(self, connection, config):
+    def _connect_succeeded(self, result):
+        connection, config = result
         self.connection = connection
         self._propagate_connection()
         self._set_connected(True)
-        self.bt_connect['state'] = 'normal'
-        self.bt_connect['text'] = 'Reconnect'
-        # Title (not just the log) so unit/firmware stay visible after later
-        # log messages scroll past them.
-        self.title('OSpRad %s - unit #%d, firmware v%s'
-                  % (__version__, config.unit_number, config.firmware))
+        self.bt_connect.setEnabled(True)
+        self.bt_connect.setText('Reconnect')
+        # Title (not just the log) so unit/firmware stay visible after later log messages.
+        self.setWindowTitle('OSpRad %s - unit #%d, firmware v%s'
+                            % (__version__, config.unit_number, config.firmware))
         status = ('Connected to unit #%d on %s (firmware v%s)'
                   % (config.unit_number, connection.port, config.firmware))
         self._log(status)
@@ -567,24 +585,25 @@ class OSpRadApp(tk.Tk):
     def _update_sensor_status(self, config):
         detected = config.sensor_detected
         if detected is None:
-            self.sensor_verdict_label.config(text='? Optical sensor: unknown (older firmware?)',
-                                             style='Muted.TLabel')
-            self.sensor_detail_label.config(text='')
+            self.sensor_verdict_label.setText(
+                '? Optical sensor: not checked (needs firmware 3.2.0 or newer)')
+            _set_role(self.sensor_verdict_label, 'muted')
+            self.sensor_detail_label.setText('')
             return
         if detected:
-            self.sensor_verdict_label.config(text='✓ Optical sensor: detected', style='Good.TLabel')
+            self.sensor_verdict_label.setText('✓ Optical sensor: detected')
+            _set_role(self.sensor_verdict_label, 'good')
         else:
-            self.sensor_verdict_label.config(text='✗ Optical sensor: not detected', style='Bad.TLabel')
-        # Evidence-based, not certain - see SENSOR_ROUGHNESS_THRESHOLD's caveats.
-        self.sensor_detail_label.config(
-            text='roughness %.1f (threshold %.1f), raw ADC swing %d'
-            % (config.sensor_roughness, serial_io.SENSOR_ROUGHNESS_THRESHOLD,
-               config.sensor_scan_range))
+            self.sensor_verdict_label.setText('✗ Optical sensor: not detected')
+            _set_role(self.sensor_verdict_label, 'bad')
+        self.sensor_detail_label.setText(
+            'roughness %.2f / repeat %.2f = %.2f (threshold %.2f), raw ADC swing %d'
+            % (config.sensor_roughness, config.sensor_repeat, config.sensor_repeat_ratio,
+               serial_io.SENSOR_REPEAT_RATIO_THRESHOLD, config.sensor_scan_range))
 
     def _test_motor(self):
-        # RC servos have no feedback wire, so there is no electrical self-check -
-        # the test just jogs to two clearly different angles and the visible swing
-        # is the confirmation.
+        # RC servos have no feedback wire (see serial_io sensor_self_test); the test
+        # just jogs to two clearly different angles and the visible swing is the proof.
         if self.connection is None:
             return
         try:
@@ -596,26 +615,22 @@ class OSpRadApp(tk.Tk):
         self._motor_test_angle = 150 if self._motor_test_angle == 30 else 30
 
     def _update_conn_labels(self, text):
-        self.conn_status_label.config(text=text)
-        self.debug_status_label.config(text=text)
+        self.conn_status_label.setText(text)
+        self.debug_status_label.setText(text)
 
     def _propagate_connection(self):
-        for tab in (self.unit_setup_tab, self.linearisation_tab, self.sensitivity_tab,
-                   self.cosine_tab, self.monitor_cal_tab):
-            tab.set_connection(self.connection)
+        for widget in (self.unit_setup_tab, self.linearisation_tab, self.sensitivity_tab,
+                      self.cosine_tab, self.transfer_tab, self.monitor_cal_tab):
+            widget.set_connection(self.connection)
 
     def _set_connected(self, connected):
         """Grey out hardware-dependent controls while disconnected."""
-        state = 'normal' if connected else 'disabled'
         for button in (self.bt_rad, self.bt_irr, self.bt_motor_test):
-            button['state'] = state
-        # Start also needs repeat to not already be running; Stop stays enabled so a
-        # repeat in progress can still be cancelled if the connection drops mid-run.
-        self.bt_repeat_start['state'] = 'normal' if (connected and not self._repeat_running) else 'disabled'
+            button.setEnabled(connected)
+        # Stop stays enabled so a repeat in progress can still be cancelled mid-run.
+        self.bt_repeat_start.setEnabled(connected and not self._repeat_running)
         if not connected:
-            self.bt_save['state'] = 'disabled'
-
-    # ---------------- actions ----------------
+            self.bt_save.setEnabled(False)
 
     def _measure(self, mode):
         if self.connection is None:
@@ -649,36 +664,36 @@ class OSpRadApp(tk.Tk):
         self.measurement = measurement
         self.reading = datalog.format_measurement(mode, measurement, flux, luminance, calib.wavelength)
         self._last_luminance = luminance
-        self.bt_save['state'] = 'normal'
+        self._refresh_save_button()
 
     def _update_analysis(self, wavelength, flux, calib):
         peak = analysis.peak_wavelength(wavelength, flux)
         fw = analysis.fwhm(wavelength, flux)
-        self._analysis_labels['peak'].config(text='%.1f nm' % peak)
-        self._analysis_labels['fwhm'].config(
-            text=('%.1f nm' % fw) if fw is not None else 'n/a (broadband)')
+        self._analysis_labels['peak'].setText('%.1f nm' % peak)
+        self._analysis_labels['fwhm'].setText(
+            ('%.1f nm' % fw) if fw is not None else 'n/a (broadband)')
 
         chroma = calib.chromaticity(flux)
         if chroma is not None:
             x, y = chroma
             cct = calibration.cct_from_xy(x, y)
-            self._analysis_labels['cie_x'].config(text='%.4f' % x)
-            self._analysis_labels['cie_y'].config(text='%.4f' % y)
-            self._analysis_labels['cct'].config(text=('%.0f K' % cct) if cct is not None else '-')
+            self._analysis_labels['cie_x'].setText('%.4f' % x)
+            self._analysis_labels['cie_y'].setText('%.4f' % y)
+            self._analysis_labels['cct'].setText(('%.0f K' % cct) if cct is not None else '-')
         else:
-            self._analysis_labels['cie_x'].config(text='-')
-            self._analysis_labels['cie_y'].config(text='-')
-            self._analysis_labels['cct'].config(text='-')
+            self._analysis_labels['cie_x'].setText('-')
+            self._analysis_labels['cie_y'].setText('-')
+            self._analysis_labels['cct'].setText('-')
 
     def _push_settings(self):
-        int_time = int(self.int_time.get())
+        int_time = int(self.int_time_edit.text())
         if int_time != self._prev_int_time:
             self.connection.set_integration_time(int_time)
             self._prev_int_time = int_time
             self._log('-> integration time %dms' % int_time, level='debug')
 
-        n_min = max(1, int(self.min_scans.get()))
-        n_max = min(50, int(self.max_scans.get()))
+        n_min = max(1, int(self.min_scans_edit.text()))
+        n_max = min(50, int(self.max_scans_edit.text()))
         if n_max < n_min:
             n_max = n_min
         if (n_min, n_max) != self._prev_scans:
@@ -686,31 +701,63 @@ class OSpRadApp(tk.Tk):
             self._prev_scans = (n_min, n_max)
             self._log('-> scan range %d-%d' % (n_min, n_max), level='debug')
 
+    def _set_save_error(self, message, role='bad'):
+        """Inline complaint under the Save button; an empty message hides it."""
+        self.save_error_label.setText(message)
+        _set_role(self.save_error_label, role)
+        self.save_error_label.setVisible(bool(message))
+
+    def _refresh_save_button(self):
+        """Save is only live once there is something to save. Rather than leave a dead
+        grey control with no explanation, say what is missing."""
+        has_reading = self.reading is not None
+        self.bt_save.setEnabled(has_reading)
+        if has_reading:
+            self._set_save_error('')
+        else:
+            self._set_save_error(
+                'No reading yet - take a Radiance or Irradiance measurement first.',
+                role='muted')
+
+    def _on_save_clicked(self):
+        """Validation lives here rather than in _save() because repeat mode calls _save()
+        directly - an unattended session must not stall waiting for someone to type a
+        label."""
+        if self.reading is None:
+            self._set_save_error('No reading to save - take a measurement first.')
+            return
+        if not self.save_label_edit.text().strip():
+            self._set_save_error('Enter a label before saving this reading.')
+            self.save_label_edit.setFocus()
+            return
+        self._set_save_error('')
+        self._save()
+
     def _save(self):
         if self.reading is None:
             return
         settings, data, wavelength = self.reading
-        label = self.save_label.get()
+        label = self.save_label_edit.text()
         offset = datalog.append_reading(DATA_FILE, label, self.measurement.unit_number,
                                         settings, data, wavelength)
-        self.bt_save['state'] = 'disabled'
+        self.bt_save.setEnabled(False)
         stamp = time.strftime('%H:%M:%S')
         luminance_text = f'{self._last_luminance:.3g}' if self._last_luminance is not None else ''
-        self.saved_tree.insert('', 0, iid=str(offset), values=(
-            stamp, label or '(unlabelled)', self.measurement.mode, luminance_text))
+        item = QTreeWidgetItem([stamp, label or '(unlabelled)', self.measurement.mode, luminance_text])
+        item.setData(0, Qt.ItemDataRole.UserRole, offset)
+        self.saved_tree.insertTopLevelItem(0, item)
         self._log('Saved reading "%s"' % (label or '(unlabelled)'))
 
     def _load_saved_readings(self):
-        self.saved_tree.delete(*self.saved_tree.get_children())
+        self.saved_tree.clear()
         for entry in datalog.iter_index(DATA_FILE):
-            self.saved_tree.insert('', 'end', iid=str(entry.offset), values=(
-                entry.time, entry.label or '(unlabelled)', entry.mode, f'{entry.luminance:.3g}'))
+            item = QTreeWidgetItem([entry.time, entry.label or '(unlabelled)', entry.mode,
+                                    f'{entry.luminance:.3g}'])
+            item.setData(0, Qt.ItemDataRole.UserRole, entry.offset)
+            self.saved_tree.addTopLevelItem(item)
 
-    def _on_saved_double_click(self, event):
-        row_id = self.saved_tree.identify_row(event.y)
-        if not row_id:
-            return
-        offset = int(row_id)
+    def _on_saved_double_click(self, item, column):
+        offset = item.data(0, Qt.ItemDataRole.UserRole)
         if offset in self._compared_offsets:
             self._remove_from_comparison(offset)
         else:
@@ -720,17 +767,15 @@ class OSpRadApp(tk.Tk):
         try:
             reading = datalog.load_reading(DATA_FILE, offset)
             calib = self.store.get(reading.unit_number)
-            calib._derive()  # populates .wavelength - normally a side effect of
-                              # to_flux()/luminance(), neither of which runs on this
-                              # reload-from-disk path
+            calib._derive()  # .wavelength is normally derived as a side effect of
+                              # to_flux()/luminance(); this reload path triggers neither.
         except (OSError, ValueError, calibration.CalibrationError) as exc:
             self._log(str(exc), level='error')
             return
         label_text = reading.label or '%s %s' % (reading.date, reading.time)
-        # The plot's y-axis unit label reflects only the first curve added (see
+        # The plot's y-axis label reflects only the first curve added (see
         # SpectrumPlot._redraw), so tag each curve's mode in its legend - radiance
-        # and irradiance are different physical units and a mixed comparison would
-        # otherwise silently imply they're all in whichever unit was added first.
+        # and irradiance are different physical units.
         mode_tag = 'radiance' if reading.mode == 'r' else 'irradiance'
         self.history_plot.add_curve(offset, calib.wavelength, reading.flux, mode=reading.mode,
                                     style='overlay', label='%s [%s]' % (label_text, mode_tag))
@@ -745,45 +790,60 @@ class OSpRadApp(tk.Tk):
         self.history_plot.clear_curves()
         self._compared_offsets.clear()
 
-    # ---------------- History tab: right-click menu ----------------
+    # History tab: right-click (or, on a touchscreen, long-press) menu
 
-    def _on_saved_right_click(self, event):
-        row_id = self.saved_tree.identify_row(event.y)
-        if not row_id:
+    def _on_saved_context_menu(self, pos):
+        item = self.saved_tree.itemAt(pos)
+        if item is None:
             return
-        if row_id not in self.saved_tree.selection():
-            self.saved_tree.selection_set(row_id)
+        if item not in self.saved_tree.selectedItems():
+            self.saved_tree.setCurrentItem(item)
 
-        selection = self.saved_tree.selection()
-        menu = tk.Menu(self, tearoff=0)
-        menu.add_command(label='Compare', command=self._compare_selected_readings)
-        menu.add_command(label='Rename...', command=self._rename_selected_reading,
-                         state='normal' if len(selection) == 1 else 'disabled')
-        menu.add_command(label='Export...', command=self._export_selected_readings)
-        menu.add_separator()
-        menu.add_command(label='Delete...', command=self._delete_selected_readings)
-        try:
-            menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            menu.grab_release()
+        menu = self._build_saved_menu()
+        menu.exec(self.saved_tree.viewport().mapToGlobal(pos))
+
+    def _build_saved_menu(self):
+        """Built separately from _on_saved_context_menu so the contents can be checked
+        without opening a modal menu."""
+        selection = self.saved_tree.selectedItems()
+        single = len(selection) == 1
+        menu = QMenu(self)
+        show_action = menu.addAction('Show this graph', self._show_only_selected_reading)
+        show_action.setEnabled(single)
+        menu.addAction('Add to comparison', self._compare_selected_readings)
+        rename_action = menu.addAction('Rename...', self._rename_selected_reading)
+        rename_action.setEnabled(single)
+        menu.addAction('Export...', self._export_selected_readings)
+        menu.addSeparator()
+        menu.addAction('Delete...', self._delete_selected_readings)
+        return menu
+
+    def _show_only_selected_reading(self):
+        """Replace whatever is on the comparison plot with just this reading - the
+        common case of "show me that one", which otherwise took a Clear then a Compare."""
+        selection = self.saved_tree.selectedItems()
+        if len(selection) != 1:
+            return
+        self._clear_history_plot()
+        self._add_to_comparison(selection[0].data(0, Qt.ItemDataRole.UserRole))
 
     def _compare_selected_readings(self):
-        for row_id in self.saved_tree.selection():
-            offset = int(row_id)
+        for item in self.saved_tree.selectedItems():
+            offset = item.data(0, Qt.ItemDataRole.UserRole)
             if offset not in self._compared_offsets:
                 self._add_to_comparison(offset)
 
     def _rename_selected_reading(self):
-        selection = self.saved_tree.selection()
-        if len(selection) != 1:
+        items = self.saved_tree.selectedItems()
+        if len(items) != 1:
             return
-        offset = int(selection[0])
-        current_label = self.saved_tree.item(selection[0], 'values')[1]
+        item = items[0]
+        offset = item.data(0, Qt.ItemDataRole.UserRole)
+        current_label = item.text(1)
         if current_label == '(unlabelled)':
             current_label = ''
-        new_label = simpledialog.askstring('OSpRad', 'Label:', initialvalue=current_label,
-                                           parent=self)
-        if new_label is None:
+        new_label, ok = QInputDialog.getText(self, 'OSpRad', 'Label:', text=current_label)
+        if not ok:
             return
         try:
             datalog.rename_reading(DATA_FILE, offset, new_label)
@@ -791,41 +851,41 @@ class OSpRadApp(tk.Tk):
             self._log(str(exc), level='error')
             return
         # A label of different length shifts every later row's byte offset (see
-        # datalog.rename_reading), so any compared curve may now point at the wrong
-        # row - clear rather than risk a silently wrong plot.
+        # datalog.rename_reading), so any compared curve may now point at the wrong row.
         self._clear_history_plot()
         self._load_saved_readings()
         self._log('Renamed reading to "%s"' % (new_label or '(unlabelled)'))
 
     def _delete_selected_readings(self):
-        selection = self.saved_tree.selection()
-        if not selection:
+        items = self.saved_tree.selectedItems()
+        if not items:
             return
-        offsets = [int(row_id) for row_id in selection]
+        offsets = [item.data(0, Qt.ItemDataRole.UserRole) for item in items]
         count = len(offsets)
-        if not messagebox.askyesno('OSpRad', 'Delete %d selected reading%s? This cannot '
-                                   'be undone.' % (count, '' if count == 1 else 's'),
-                                   parent=self):
+        reply = QMessageBox.question(
+            self, 'OSpRad', 'Delete %d selected reading%s? This cannot be undone.'
+            % (count, '' if count == 1 else 's'),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
             return
         try:
             datalog.delete_readings(DATA_FILE, offsets)
         except OSError as exc:
             self._log(str(exc), level='error')
             return
-        # Deleting rows shifts every later row's byte offset - same reasoning as in
-        # _rename_selected_reading.
+        # Deleting rows shifts every later row's byte offset - same as in rename.
         self._clear_history_plot()
         self._load_saved_readings()
         self._log('Deleted %d reading%s' % (count, '' if count == 1 else 's'))
 
     def _export_selected_readings(self):
-        selection = self.saved_tree.selection()
-        if not selection:
+        items = self.saved_tree.selectedItems()
+        if not items:
             return
-        offsets = [int(row_id) for row_id in selection]
-        path = filedialog.asksaveasfilename(
-            defaultextension='.csv', initialdir=os.path.dirname(os.path.abspath(DATA_FILE)),
-            filetypes=[('CSV file', '*.csv')])
+        offsets = [item.data(0, Qt.ItemDataRole.UserRole) for item in items]
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'OSpRad', os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), ''),
+            'CSV file (*.csv)')
         if not path:
             return
         try:
@@ -837,69 +897,57 @@ class OSpRadApp(tk.Tk):
                   % (len(offsets), '' if len(offsets) == 1 else 's', path))
 
     def _save_figure(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension='.png', initialdir=os.path.dirname(os.path.abspath(DATA_FILE)),
-            filetypes=[('PNG image', '*.png'), ('PDF document', '*.pdf')])
+        path, _ = QFileDialog.getSaveFileName(
+            self, 'OSpRad', os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), ''),
+            'PNG image (*.png);;PDF document (*.pdf)')
         if path:
             self.plot.save_as_image(path)
-
-    def _toggle_theme(self):
-        dark = self.dark_mode.get()
-        if sv_ttk:
-            sv_ttk.set_theme('dark' if dark else 'light')
-        self.plot.apply_theme(dark)
-        self.history_plot.apply_theme(dark)
-        self._paint_background()
 
     def _start_repeat(self):
         if self._repeat_running or self.connection is None:
             return
-        if not self.repeat_irr.get() and not self.repeat_rad.get():
+        if not self.repeat_irr_check.isChecked() and not self.repeat_rad_check.isChecked():
             self._log('Tick Irradiance and/or Radiance under "Measure" before starting '
                       'automatic repeat.', level='error')
             return
         try:
-            if int(self.repeat_time.get()) < 1:
+            if int(self.repeat_time_edit.text()) < 1:
                 raise ValueError
         except ValueError:
             self._log('Repeat interval must be a whole number of seconds.', level='error')
             return
         self._repeat_running = True
-        self.bt_repeat_start['state'] = 'disabled'
-        self.bt_repeat_stop['state'] = 'normal'
+        self.bt_repeat_start.setEnabled(False)
+        self.bt_repeat_stop.setEnabled(True)
         self._log('Automatic repeat started.')
-        self._repeat_after_id = self.after(50, self._repeat_tick)
+        QTimer.singleShot(50, self._repeat_tick)
 
     def _stop_repeat(self):
         if not self._repeat_running:
             return
         self._repeat_running = False
-        if self._repeat_after_id is not None:
-            self.after_cancel(self._repeat_after_id)
-            self._repeat_after_id = None
-        if self._countdown_after_id is not None:
-            self.after_cancel(self._countdown_after_id)
-            self._countdown_after_id = None
         self._repeat_next_time = None
-        self.bt_repeat_start['state'] = 'normal' if self.connection is not None else 'disabled'
-        self.bt_repeat_stop['state'] = 'disabled'
-        self.repeat_status_label.config(text='Not running.')
+        self.bt_repeat_start.setEnabled(self.connection is not None)
+        self.bt_repeat_stop.setEnabled(False)
+        self.repeat_status_label.setText('Not running.')
         self._log('Automatic repeat stopped.')
 
     def _repeat_tick(self):
+        # Every continuation below is guarded by _repeat_running, so a singleShot that
+        # still fires after Stop was pressed is a harmless no-op.
         if not self._repeat_running:
             return
-        if self.repeat_irr.get():
+        if self.repeat_irr_check.isChecked():
             self._measure('i')
             self._save()
-        if self.repeat_rad.get():
+        if self.repeat_rad_check.isChecked():
             self._measure('r')
             self._save()
         if not self._repeat_running:
             return  # Stop may have fired during the _measure()/_save() calls above
-        interval = max(1, int(self.repeat_time.get()))
+        interval = max(1, int(self.repeat_time_edit.text()))
         self._repeat_next_time = time.time() + interval
-        self._repeat_after_id = self.after(interval * 1000, self._repeat_tick)
+        QTimer.singleShot(interval * 1000, self._repeat_tick)
         self._update_repeat_countdown()
 
     def _update_repeat_countdown(self):
@@ -907,22 +955,69 @@ class OSpRadApp(tk.Tk):
             return
         remaining = max(0, round(self._repeat_next_time - time.time()))
         mins, secs = divmod(int(remaining), 60)
-        self.repeat_status_label.config(text='Next measurement in %d:%02d' % (mins, secs))
-        self._countdown_after_id = self.after(1000, self._update_repeat_countdown)
+        self.repeat_status_label.setText('Next measurement in %d:%02d' % (mins, secs))
+        QTimer.singleShot(1000, self._update_repeat_countdown)
 
     def _log(self, text, level='info'):
-        if LOG_LEVEL_RANK.get(level, 1) < LOG_LEVEL_RANK.get(self.log_level.get(), 1):
-            return  # below the Debug tab's Level selector threshold
+        # Mirror to stdout before the level filter: p4a routes stdout into logcat, which
+        # is the only way any of this reaches an Android bug report.
+        print('OSpRad[%s] %s' % (level, text), flush=True)
+
+        if LOG_LEVEL_RANK.get(level, 1) < LOG_LEVEL_RANK.get(self.log_level_combo.currentText(), 1):
+            return  # below the Debug tab's Level selector
         stamp = time.strftime('%H:%M:%S')
-        self.log_text.configure(state='normal')
-        tags = (level,) if level in ('error', 'warning', 'debug') else ()
-        self.log_text.insert('end', '[%s] %s\n' % (stamp, text), tags)
-        line_count = int(self.log_text.index('end-1c').split('.')[0])
-        if line_count > LOG_MAX_LINES:
-            self.log_text.delete('1.0', '%d.0' % (line_count - LOG_MAX_LINES))
-        self.log_text.see('end')
-        self.log_text.configure(state='disabled')
+        line = '[%s] %s' % (stamp, text)
+        color = LOG_COLORS.get(level)
+        if color:
+            self.log_text.appendHtml('<span style="color:%s">%s</span>' % (color, html.escape(line)))
+        else:
+            self.log_text.appendPlainText(line)
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self.log_text.setTextCursor(cursor)
+        self.log_text.ensureCursorVisible()
+
+    def closeEvent(self, event):
+        # Both run hardware I/O on background QThreads; see qt_worker.wait_for for why.
+        wait_for(self._connect_worker)
+        wait_for(self.monitor_cal_tab.worker)
+        super().closeEvent(event)
+
+
+def _app_icon():
+    # Embedded PNG so every distribution channel (including a pip install) gets the
+    # window icon; see pyproject.toml for why this isn't a packaged data file.
+    try:
+        from _icon_bundled import PNG_BYTES
+    except ImportError:
+        return QIcon()
+    pixmap = QPixmap()
+    pixmap.loadFromData(PNG_BYTES, 'PNG')
+    return QIcon(pixmap)
+
+
+def _parse_args(argv):
+    parser = argparse.ArgumentParser(prog='OSpRad')
+    parser.add_argument(
+        '--port', default=None,
+        help='Serial port to connect to, e.g. COM5 or /dev/ttyUSB0. Overrides the GUI\'s '
+             'port selector on startup. Default: auto-detect (same as the GUI).')
+    # parse_known_args so a Qt flag (-style, -platform, ...) ahead of ours doesn't error out.
+    args, _unknown = parser.parse_known_args(argv)
+    return args
+
+
+def main():
+    args = _parse_args(sys.argv[1:])
+    app = QApplication(sys.argv)
+    app.setWindowIcon(_app_icon())
+    # There is no hovering on a touchscreen, so the tooltips scattered through the app
+    # would otherwise be unreachable there. Bound to the app so it outlives this scope.
+    app._touch_tooltips = touch.enable_touch_tooltips(app)
+    window = OSpRadApp(port=args.port)
+    window.show()
+    sys.exit(app.exec())
 
 
 if __name__ == '__main__':
-    OSpRadApp().mainloop()
+    main()

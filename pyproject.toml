@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "OSpRad"
+dynamic = ["version"]
+description = "Control app for the OSpRad open-source, low-cost, high-sensitivity spectroradiometer"
+readme = "README.md"
+license = { text = "GPL-3.0-only" }
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib",
+    "pyserial",
+    "numpy",
+    "PySide6",
+]
+
+[project.optional-dependencies]
+# scipy is only needed for the .mat export; it has no Android build, so it's optional.
+psychtoolbox = ["scipy"]
+
+[project.urls]
+Homepage = "https://github.com/troscianko/OSpRad"
+
+[project.gui-scripts]
+osprad = "OSpRad:main"
+
+[tool.setuptools]
+# Flat py-modules rather than a package, so the same `import serial_io`-style sibling
+# imports work unchanged from a source checkout, a PyInstaller freeze, a pip install
+# and an Android APK.
+package-dir = { "" = "app" }
+py-modules = [
+    "OSpRad",
+    "_calibration_data_bundled",
+    "_icon_bundled",
+    "_version",
+    "analysis",
+    "calibration",
+    "calibration_io",
+    "calibration_wizard",
+    "datalog",
+    "monitor_calibration",
+    "plotting",
+    "qt_worker",
+    "serial_io",
+    "touch",
+]
+
+[tool.setuptools.dynamic]
+# Attribute access, not an import: reading OSpRad.__version__ would pull in PySide6 at build time.
+version = { attr = "_version.__version__" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+# Vendored copies of python-for-android's own recipes; kept diffable against upstream.
+extend-exclude = ["packaging/android/local_recipes"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "W", "B"]

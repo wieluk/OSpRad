@@ -1,0 +1,75 @@
+--- pyjnius.orig/jnius/env.py	2026-08-25 15:57:21.634459561 +0200
++++ pyjnius/jnius/env.py	2026-08-25 15:57:33.040286163 +0200
+@@ -288,7 +288,9 @@
+ 
+ class AndroidJavaLocation(UnixJavaLocation):
+     def get_libraries(self):
+-        return ['SDL2', 'log']
++        # OSpRad local patch: no SDL/webview library needed - our JNIEnv comes
++        # from Qt via dlopen/dlsym (see jnius_jvm_android.pxi), not a linked symbol.
++        return ['log']
+ 
+     def get_include_dirs(self):
+         # When cross-compiling for Android, we should not use the include dirs
+--- pyjnius.orig/jnius/jnius_jvm_android.pxi	2026-08-25 15:55:20.490965645 +0200
++++ pyjnius/jnius/jnius_jvm_android.pxi	2026-08-25 15:55:32.895130462 +0200
+@@ -1,6 +1,56 @@
+-# on android, rely on SDL to get the JNI env
+-cdef extern JNIEnv *SDL_AndroidGetJNIEnv()
++# OSpRad local patch: pyjnius has no official support for python-for-android's "qt"
++# bootstrap (used by pyside6-android-deploy) - its only JNIEnv-getter patches target
++# SDL2/SDL3/webview bootstraps, all of which expose the JNIEnv via a JNI-callable
++# native entry point (Java_..._nativeInit(JNIEnv*, ...)) that the "qt" bootstrap's own
++# native source (python-for-android's shared bootstraps/common/build/jni/application/
++# src/start.c) simply doesn't define - confirmed by reading that file directly. Qt
++# obtains its own JavaVM entirely separately, via libQt6Core's own JNI_OnLoad (called
++# automatically when Java loads it), exposed only through Qt's public C++ API
++# (QJniEnvironment). We don't have Qt's C++ headers available in this build
++# environment to call that API normally, so this instead uses dlopen/dlsym against
++# the already-loaded libQt6Core to call QJniEnvironment's default constructor,
++# getJniEnv(), and destructor directly by their mangled symbol names (Itanium C++
++# ABI - a non-virtual, no-argument member function is called exactly like a C
++# function taking the object pointer as its only argument, so this doesn't need a
++# vtable or the class's exact size, just a generously-sized scratch buffer for the
++# temporary QJniEnvironment instance).
++
++cdef extern from 'dlfcn.h' nogil:
++    void* dlopen(const char *filename, int flag)
++    char *dlerror()
++    void *dlsym(void *handle, const char *symbol)
++    unsigned int RTLD_NOW
++    unsigned int RTLD_GLOBAL
++
++ctypedef void (*_qt_jnienv_ctor_t)(void *this_)
++ctypedef void *(*_qt_jnienv_getenv_t)(void *this_)
++ctypedef void (*_qt_jnienv_dtor_t)(void *this_)
+ 
+ 
+ cdef JNIEnv *get_platform_jnienv() except NULL:
+-    return <JNIEnv*>SDL_AndroidGetJNIEnv()
++    cdef void *handle = dlopen(b"libQt6Core_arm64-v8a.so", RTLD_NOW | RTLD_GLOBAL)
++    if handle == NULL:
++        handle = dlopen(b"libQt6Core.so", RTLD_NOW | RTLD_GLOBAL)
++    if handle == NULL:
++        raise SystemError(
++            "OSpRad qt_jnienv_getter: unable to dlopen libQt6Core: {0}".format(
++                dlerror()))
++
++    cdef void *ctor_sym = dlsym(handle, b"_ZN15QJniEnvironmentC1Ev")
++    cdef void *getenv_sym = dlsym(handle, b"_ZN15QJniEnvironment9getJniEnvEv")
++    cdef void *dtor_sym = dlsym(handle, b"_ZN15QJniEnvironmentD1Ev")
++    if ctor_sym == NULL or getenv_sym == NULL or dtor_sym == NULL:
++        raise SystemError(
++            "OSpRad qt_jnienv_getter: unable to find QJniEnvironment symbols "
++            "in libQt6Core: {0}".format(dlerror()))
++
++    cdef char buf[128]
++    cdef void *obj = <void *>buf
++    (<_qt_jnienv_ctor_t>ctor_sym)(obj)
++    cdef void *env = (<_qt_jnienv_getenv_t>getenv_sym)(obj)
++    (<_qt_jnienv_dtor_t>dtor_sym)(obj)
++
++    if env == NULL:
++        raise SystemError(
++            "OSpRad qt_jnienv_getter: QJniEnvironment::getJniEnv() returned NULL")
++    return <JNIEnv *>env

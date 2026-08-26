@@ -1,94 +1,53 @@
 
 /*
- * OSpRad firmware 3.1.0
- * Written by Jolyon Troscianko - 2022
- * Released under GPL-3.0 license
- * https://github.com/troscianko/OSpRad
+ * OSpRad firmware
  *
  * For the Arduino Nano. Tested with Elegoo units and unbranded clones; use the
  * "old bootloader 328p" option if normal upload fails.
  * Inspired by https://impfs.github.io/review/
  * C12880MA datasheet: https://www.farnell.com/datasheets/2822646.pdf
  *
- * ---- 2.0.0 ----
- * Unit number and shutter-wheel positions (dark/irradiance/radiance) moved to
- * EEPROM, settable from the Python app - no more editing constants and
- * reflashing per unit. Values below are defaults used only on a fresh Arduino.
- *
- * ---- 2.1.0 ----
- * 'd' diagnostic command: app flags likely-disconnected sensor at connect time.
- * No equivalent for the servo - RC servos are open-loop.
- *
- * ---- 3.0.0 ----
- * Commands are newline-terminated. The old readString() waited out ~1s of
- * serial silence to decide a command was "done", so every command cost ~1s,
- * and a UI slider firing faster than that could glue multiple commands into
- * garbage (arg.replace() strips every matching letter). Newline framing
- * parses exactly one command per call and replies in a few ms.
- *
- * Breaking wire-protocol change vs 2.x: the app must send '\n' after every
- * command. The 3.x app is required.
- *
- * ---- 3.1.0 ----
- * 'd' self-test also reports roughness (mean absolute difference between
- * adjacent pixels). Raw ADC swing (max-min) alone was worthless on
- * disconnected units - it ranged ~60-166 across identical conditions.
- * Roughness held at 0.7-1.2 because a floating pin picks up slow-drifting
- * interference that moves amplitude around without making adjacent samples
- * jump. The app now thresholds on roughness.
- *
- * New serial commands (see loop()):
- *   u<n>  - set unit number (EEPROM)
- *   sD/sI/sR - save current wheel angle as dark / irradiance / radiance position
- *   g     - report config: "CFG,unit:<n>,dark:<a>,irr:<a>,rad:<a>,configured:<0|1>,fw:<ver>"
- *   d     - sensor self-test: "DIAG,min:<n>,max:<n>,roughness:<f>"
- *           the app thresholds on roughness, not min/max.
- *
- * Replies are framed with a type prefix so the app never has to guess:
- * "OK,..." / "ERR,<reason>" / "CFG,..." / "DATA,..." / "DIAG,...".
- * DATA lines also carry a trailing checksum so a corrupted/truncated reply
- * from a flaky USB connection can be retried.
- *
- * Breaking protocol change vs 1.x: 3.x app requires this firmware line.
+ * Commands are newline-terminated, one per line (see loop()); replies are
+ * type-prefixed - "OK,..." / "ERR,<reason>" / "CFG,..." / "DATA,..." / "DIAG,..."
+ * - and DATA lines carry a trailing checksum so a truncated reply can be retried.
+ * The app must share this firmware's major version.
  */
 
 
 
 #include <Servo.h>
 #include <EEPROM.h>
-Servo myservo;  // create servo object to control a servo
+Servo myservo;
 
-#define FIRMWARE_VERSION "3.1.0"
+#define FIRMWARE_VERSION "3.2.0"
 
 
-// ---- EEPROM layout ----
+// EEPROM layout: each *_ADDR holds one int (2 bytes).
 #define EEPROM_MAGIC 0xA5
 #define EE_ADDR_MAGIC 0
-#define EE_ADDR_UNIT 1     // int, 2 bytes
-#define EE_ADDR_DARK 3     // int, 2 bytes
-#define EE_ADDR_IRR 5      // int, 2 bytes
-#define EE_ADDR_RAD 7      // int, 2 bytes
+#define EE_ADDR_UNIT 1
+#define EE_ADDR_DARK 3
+#define EE_ADDR_IRR  5
+#define EE_ADDR_RAD  7
 
 bool configured = false; // true once EEPROM has been written at least once
 
 
-// THESE FOUR VALUES ARE ONLY USED UNTIL THE UNIT IS CONFIGURED VIA EEPROM (see above):
+// Fallback defaults - overwritten by the Python app the first time the unit is
+// configured. Manual "w<angle>" jogging still works to set them up by hand.
 
-int unitNumber = 1; // Add a unit-specific number here. This number is looked up for applying calibration data
+int unitNumber = 1;
+int posDark = 98;   // angle for dark measurement
+int posIrr = 146;   // angle for irradiance (cosine diffuser)
+int posRad = 57;    // angle for radiance measurement (clear aperture)
 
-// Fallback defaults only - once configured, set/change these from the OSpRad app instead
-// (Python app: Unit & wheel setup wizard). Manual "w<angle>" jogging still works if needed.
-int posDark = 98; // angle for dark measurement
-int posIrr = 146; // angle for irradiance (cosine diffuser)
-int posRad = 57; // angle for radiance measurement (clear)
-
-int currentWheelAngle = 90; // tracks the last angle set via w<angle>, used by sD/sI/sR
+int currentWheelAngle = 90; // last angle set via w<angle>, used by sD/sI/sR
 
 
 
 
-int servoDelay = 300; // millisecond delay for servo to move
-int servoDetachDelay = 1500; // millisecond delay for servo to detach (causes feedback and noisy measurements)
+int servoDelay = 300;
+int servoDetachDelay = 1500; // Detach delay: leaving the servo powered adds electrical noise.
 int servoPin = 8;
 
 #define TRGpin A0
@@ -96,7 +55,7 @@ int servoPin = 8;
 #define CLKpin A2
 #define VIDEOpin A3
 
-#define nSites 288 //
+#define nSites 288
 uint16_t data[nSites] [2];
 int dataSaveDim = 0;
 
@@ -196,23 +155,19 @@ void csPrintFloat2(float v){
 
 
 void setup(){
-  //myservo.attach(servoPin);  // attaches the servo on pin 9 to the servo object
-
   loadConfig();
 
-  //Set desired pins to OUTPUT
   pinMode(CLKpin, OUTPUT);
   pinMode(STpin, OUTPUT);
 
   digitalWrite(CLKpin, HIGH);
   digitalWrite(STpin, LOW);
 
-  Serial.begin(115200); // Baud Rate set to 115200
-  // Commands are newline-terminated (see loop()), so this only ever gets hit by a
-  // truly malformed/incomplete command - keep it short so that fails fast rather
-  // than hanging for a second.
+  Serial.begin(115200);
+  // Newline-terminated commands (see loop()), so this only ever gets hit by a
+  // malformed/incomplete command - keep it short so that fails fast.
   Serial.setTimeout(200);
-  while (! Serial); // Wait untilSerial is ready
+  while (! Serial);
   readSpectrometer();
   resetData();
 }
@@ -285,26 +240,19 @@ void satTest(){
 
 }
 
-// Quick raw scan used by the 'd' diagnostic command to let the app flag a
-// likely-disconnected sensor. Deliberately does not touch the servo (that
-// has no feedback path at all, so it can't be self-tested this way) and
-// restores intTime/dataSaveDim afterwards so it has no side effect on the
-// user's configured measurement settings.
+// Raw scan pair for the 'd' diagnostic: takes two scans 150ms apart into dim 0 and
+// dim 1 (both are reset at the start of every real measurement, so clobbering them
+// here is safe) and reports roughness (mean |diff| between adjacent pixels) and
+// repeat (mean |diff| between the two scans, pixel by pixel). Never touches the
+// servo (RC servos are open-loop, nothing to test) and restores intTime/dataSaveDim.
 //
-// Reports min/max (raw amplitude) AND roughness (mean absolute difference
-// between adjacent pixels). Amplitude alone proved unreliable - the ambient
-// noise floor on a floating/disconnected pin swings wildly with unrelated
-// conditions (observed 20-166 on the same disconnected unit). Roughness is a
-// different, more physically-grounded signal: a real sensor reads out as a
-// smooth curve (adjacent pixels are physically/electrically similar, so
-// consecutive samples are correlated), while noise picked up by a floating
-// pin is essentially uncorrelated between samples - so its roughness should
-// track its own amplitude (rough ~= range) regardless of how loud that
-// amplitude is, while a connected sensor's roughness should stay low even
-// when its overall range is large. Still no real connected-sensor data to
-// confirm the second half of that - see the app-side comment where this is
-// consumed.
-void sensorSelfTest(int &outMin, int &outMax, float &outRoughness){
+// The app thresholds on roughness/repeat - a connected sensor's readout repeats
+// (pixel-to-pixel fixed pattern is a physical property), so repeat stays at
+// read-noise level. A floating pin picks up slow drifting interference uncorrelated
+// scan to scan, so repeat is large while roughness stays small. The ratio is
+// dimensionless and so independent of light level, integration time, and wheel
+// position - unlike the absolute roughness threshold this replaced.
+void sensorSelfTest(int &outMin, int &outMax, float &outRoughness, float &outRepeat){
   long savedIntTime = intTime;
   int savedDim = dataSaveDim;
 
@@ -313,15 +261,25 @@ void sensorSelfTest(int &outMin, int &outMax, float &outRoughness){
   resetData();
   readSpectrometer();
 
+  delay(150);
+
+  dataSaveDim = 1;
+  resetData();
+  readSpectrometer();
+  dataSaveDim = 0;
+
   outMin = data[0][0];
   outMax = data[0][0];
   long roughSum = 0;
+  long repeatSum = abs((long)data[0][0] - (long)data[0][1]);
   for(int i = 1; i < nSites; i++){
     if(data[i][0] < outMin) outMin = data[i][0];
     if(data[i][0] > outMax) outMax = data[i][0];
     roughSum += abs((long)data[i][0] - (long)data[i-1][0]);
+    repeatSum += abs((long)data[i][0] - (long)data[i][1]);
   }
   outRoughness = float(roughSum) / float(nSites - 1);
+  outRepeat = float(repeatSum) / float(nSites);
 
   intTime = savedIntTime;
   dataSaveDim = savedDim;
@@ -331,17 +289,13 @@ void sensorSelfTest(int &outMin, int &outMax, float &outRoughness){
 void loop(){
 
 
-
-  // Newline-terminated: parses exactly one command per call no matter how many are
-  // already queued up in the receive buffer, instead of readString()'s old behaviour
-  // of gulping everything available and waiting out ~1s of silence to decide a
-  // command was "done" - see the 3.0.0 changelog above.
+  // Newline-terminated: parses one command per call instead of readString()'s old
+  // ~1s-silence behaviour. See the 3.0.0 changelog.
   String arg = Serial.readStringUntil('\n');
   arg.trim();
 
   if (arg.length() > 0){
 
-    // manually set integration time
     if(arg.startsWith("t") == true){
       arg.replace("t", "");
       long t = (long) arg.toFloat();
@@ -355,7 +309,6 @@ void loop(){
         Serial.println(manIntTime);
       }
 
-    // change max number of scans
     } else if(arg.startsWith("a") == true){
       arg.replace("a", "");
       int v = (int) arg.toFloat();
@@ -370,7 +323,6 @@ void loop(){
         delay(100);
       }
 
-    // change min number of scans
     } else if(arg.startsWith("n") == true){
       arg.replace("n", "");
       int v = (int) arg.toFloat();
@@ -385,7 +337,6 @@ void loop(){
         delay(100);
       }
 
-    // set unit number (saved to EEPROM)
     } else if(arg.startsWith("u") == true){
       arg.replace("u", "");
       int v = (int) arg.toFloat();
@@ -397,7 +348,6 @@ void loop(){
         Serial.println(unitNumber);
       }
 
-    // save current wheel angle as dark/irradiance/radiance position
     } else if(arg.startsWith("sD") == true){
       saveWheelPosition('D', currentWheelAngle);
       Serial.print(F("OK,saved,dark,"));
@@ -413,7 +363,6 @@ void loop(){
       Serial.print(F("OK,saved,rad,"));
       Serial.println(posRad);
 
-    // report current config
     } else if(arg.startsWith("g") == true || arg.startsWith("?") == true){
       Serial.print(F("CFG,unit:")); Serial.print(unitNumber);
       Serial.print(F(",dark:")); Serial.print(posDark);
@@ -422,19 +371,16 @@ void loop(){
       Serial.print(F(",configured:")); Serial.print(configured ? 1 : 0);
       Serial.print(F(",fw:")); Serial.println(F(FIRMWARE_VERSION));
 
-    // quick sensor self-test: one raw scan, no servo movement. The app
-    // decides what counts as "likely disconnected" from min/max - firmware
-    // just reports the raw numbers.
     } else if(arg.startsWith("d") == true){
       int rawMin, rawMax;
-      float roughness;
-      sensorSelfTest(rawMin, rawMax, roughness);
+      float roughness, repeat;
+      sensorSelfTest(rawMin, rawMax, roughness, repeat);
       Serial.print(F("DIAG,min:")); Serial.print(rawMin);
       Serial.print(F(",max:")); Serial.print(rawMax);
-      Serial.print(F(",roughness:")); Serial.println(roughness, 2);
+      Serial.print(F(",roughness:")); Serial.print(roughness, 2);
+      Serial.print(F(",repeat:")); Serial.println(repeat, 2);
 
-    // manual wheel position
-    } else if(arg.startsWith("w") == true){ // filter wheel position
+    } else if(arg.startsWith("w") == true){
         arg.replace("w", "");
         int wheelAngle = (int) arg.toFloat();
         if(wheelAngle < 0 || wheelAngle > 180){
@@ -449,9 +395,7 @@ void loop(){
           myservo.detach();
         }
 
-
-    // Spec measure
-    } else if(arg.startsWith("r") == true || arg.startsWith("i") == true){ // radiance
+    } else if(arg.startsWith("r") == true || arg.startsWith("i") == true){
 
       myservo.attach(servoPin);
 
@@ -470,14 +414,13 @@ void loop(){
       delay(servoDetachDelay);
       nScans = 1;
 
-
-      // reset all data
+      // reset both data dims
       dataSaveDim = 1; // 1= dark, 0=light
       resetData();
-      dataSaveDim = 0;// must be left as 0 here for code below - temp light data
+      dataSaveDim = 0;
       resetData();
 
-      // automatically work out integration time by increasing until saturation point, then estimate ideal value
+      // Auto-expose: ramp up until saturation, then estimate a near-saturating value.
       if(manIntTime == 0){
 
             satN = 0;
@@ -485,35 +428,34 @@ void loop(){
             prevIntTime = 1;
             maxVal = 0;
 
-            resetData(); // reset dim0 data
-            readSpectrometer(); // read to dim0
+            resetData();
+            readSpectrometer();
             satTest();
 
-            if(satN == 0){ // if initial 1ms scan is over-exposed don't go any further
+            if(satN == 0){ // initial 1ms scan wasn't already over-exposed
 
               while(satN == 0){
                 prevMaxVal = maxVal;
                 prevIntTime = intTime;
                 intTime = intTime*2;
-                if(intTime > maxAutoIntTime) // do not go above max int time (takes ages to measure)
+                if(intTime > maxAutoIntTime) // do not go above max (takes ages to measure)
                   satN = 1;
                 else {
-                  resetData(); // reset dim0 data
-                  readSpectrometer(); // read to dim0
+                  resetData();
+                  readSpectrometer();
                   satTest();
                 }
 
                 delay(10);
               }
               resetData();
-              // ensure auto-value isn't too long
               float tInt = floor(float(prevIntTime*0.9*satVal)/float(prevMaxVal));
               if(tInt > maxIntTime)
                   intTime = maxIntTime;
               else intTime = tInt;
             }
 
-      } else { // initial scan with manual integration time
+      } else {
             intTime = manIntTime;
       }
 
@@ -526,11 +468,11 @@ void loop(){
 
       satSum = 0;
 
-      //-------------Integration time is short, collect sample data, then dark measurement---------
+      // Short integration time: collect all light scans, then one block of dark scans.
       if(intTime < sampleTimeMax){
 
         dataSaveDim = 1; // light data
-        for(int i=0; i<nScans; i++){ // repeatedly read spec (note one fewer scan than below because one scan is already done above)
+        for(int i=0; i<nScans; i++){ // one fewer than below: the auto-expose scan is the first light scan
           readSpectrometer();
           satTest();
           satSum = satSum + satN;
@@ -542,19 +484,19 @@ void loop(){
         delay(servoDelay);
         myservo.detach();
         delay(servoDetachDelay);
-        dataSaveDim = 0;// dark data
+        dataSaveDim = 0; // dark data
         resetData();
 
-        for(int i=0; i<nScans; i++){ // repeatedly read spec
+        for(int i=0; i<nScans; i++){
           readSpectrometer();
           delay(10);
        }
 
-      //-------------Integration time is long, take interleaved dark measurements---------
+      // Long integration time: interleave one light scan with one dark scan per loop.
       } else {
 
         for(int i=0; i<nScans; i++){
-              // light measuremeant
+              // light measurement
               myservo.attach(servoPin);
               if(measureType == 1){
                 myservo.write(posRad);
@@ -565,7 +507,7 @@ void loop(){
               myservo.detach();
               delay(servoDetachDelay);
               dataSaveDim = 1; // light data
-              readSpectrometer(); // add light measurement
+              readSpectrometer();
               satTest();
               satSum = satSum + satN;
               delay(10);
@@ -576,7 +518,7 @@ void loop(){
               myservo.detach();
               delay(servoDetachDelay);
               dataSaveDim = 0; // dark data
-              readSpectrometer(); // add dark measurement
+              readSpectrometer();
 
         }
 

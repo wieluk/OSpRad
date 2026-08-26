@@ -1,7 +1,3 @@
-# OSpRad 3.1.0
-# Released under GPL-3.0 license
-# https://github.com/troscianko/OSpRad
-
 import collections
 import csv
 import io
@@ -10,7 +6,7 @@ import time
 
 from calibration import PIXELS
 
-# data.csv column layout - fixed, 588 fields per row (0-indexed):
+# data.csv layout - fixed, 588 fields per row (0-indexed):
 #   0:label 1:unit# 2:date 3:time 4:mode 5:intTime 6:nScans 7:saturated
 #   8:luminance-label 9:luminance 10:flux-unit-label 11..298:flux (288 values)
 #   299:"rawCounts:" 300..587:rawCounts (288 values)
@@ -38,7 +34,7 @@ SavedReading = collections.namedtuple(
 
 def format_measurement(mode, measurement, flux, luminance, wavelength):
     """Bundle everything needed to write one reading: settings row, data row, and
-    the wavelength axis used for the CSV header (round-tripped into append_reading)."""
+    the wavelength axis used for the CSV header (round-tripped via append_reading)."""
     counts = [f'{c:.4f}' for c in measurement.raw_counts]
     flux_fields = [f'{flux[0]:.4f}'] + [f'{f:.4e}' for f in flux[1:]]
 
@@ -80,9 +76,9 @@ def append_reading(path, label, unit_number, settings, data, wavelength):
 
 
 def iter_index(path):
-    """Yields a ReadingIndex per saved reading in path, cheapest-possible (only parses
-    the first ~10 fields of each row, never the 576 flux/raw-count fields). Safe to call
-    when path doesn't exist yet (yields nothing)."""
+    """Yield a ReadingIndex per saved reading in path, cheapest-possible (parses only
+    the first ~10 fields; never the 576 flux/raw-count fields). Safe when path doesn't
+    exist yet (yields nothing)."""
     if not os.path.exists(path):
         return
     with open(path, 'r', newline='') as handle:
@@ -107,7 +103,7 @@ def iter_index(path):
                     int_time=int(row[IDX_INT_TIME]), n_scans=int(row[IDX_N_SCANS]),
                     saturated=float(row[IDX_SATURATED]), luminance=float(row[IDX_LUMINANCE]))
             except ValueError:
-                continue  # corrupted/truncated row - skip rather than crash the browser
+                continue  # corrupted/truncated row
 
 
 def _rewrite_rows(path, transform):
