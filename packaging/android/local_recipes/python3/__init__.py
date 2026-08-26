@@ -24,16 +24,15 @@ NDK_API_LOWER_THAN_SUPPORTED_MESSAGE = (
 
 class Python3Recipe(TargetPythonRecipe):
     '''
-    The python3's recipe
-    ^^^^^^^^^^^^^^^^^^^^
+    The python3's recipe.
 
     The python 3 recipe can be built with some extra python modules, but to do
     so, we need some libraries. By default, we ship the python3 recipe with
     some common libraries, defined in ``depends``. We also support some optional
-    libraries, which are less common that the ones defined in ``depends``, so
-    we added them as optional dependencies (``opt_depends``).
+    libraries, which are less common than the ones in ``depends``, so we added
+    them as optional dependencies (``opt_depends``).
 
-    Below you have a relationship between the python modules and the recipe
+    Below is the relationship between the python modules and the recipe
     libraries::
 
         - _ctypes: you must add the recipe for ``libffi``.
@@ -45,13 +44,13 @@ class Python3Recipe(TargetPythonRecipe):
     .. note:: This recipe can be built only against API 21+.
 
     .. versionchanged:: 2019.10.06.post0
-        - Refactored from deleted class ``python.GuestPythonRecipe`` into here
-        - Added optional dependencies: :mod:`~pythonforandroid.recipes.libbz2`
-          and :mod:`~pythonforandroid.recipes.liblzma`
+        Refactored from deleted class ``python.GuestPythonRecipe`` into here.
+        Added optional dependencies: :mod:`~pythonforandroid.recipes.libbz2`
+        and :mod:`~pythonforandroid.recipes.liblzma`.
 
     .. versionchanged:: 0.6.0
         Refactored into class
-        :class:`~pythonforandroid.python.GuestPythonRecipe`
+        :class:`~pythonforandroid.python.GuestPythonRecipe`.
     '''
 
     version = '3.11.13'
@@ -128,9 +127,8 @@ class Python3Recipe(TargetPythonRecipe):
     MIN_NDK_API = 21
     '''Sets the minimal ndk api number needed to use the recipe.
 
-    .. warning:: This recipe can be built only against API 21+, so it means
-        that any class which inherits from class:`GuestPythonRecipe` will have
-        this limitation.
+    .. warning:: This recipe can be built only against API 21+, so any class
+        that inherits from class:`GuestPythonRecipe` has this limitation.
     '''
 
     stdlib_dir_blacklist = {
@@ -155,7 +153,7 @@ class Python3Recipe(TargetPythonRecipe):
         '__pycache__',
         'tests'
     }
-    '''The directories from site packages dir that we don't want to be included
+    '''The directories from site packages dir that we don't want included
     in our python bundle.'''
 
     site_packages_excluded_dir_exceptions = [
@@ -169,19 +167,19 @@ class Python3Recipe(TargetPythonRecipe):
     site_packages_filen_blacklist = [
         '*.py'
     ]
-    '''The file extensions from site packages dir that we don't want to be
+    '''The file extensions from site packages dir that we don't want
     included in our python bundle.'''
 
     compiled_extension = '.pyc'
     '''the default extension for compiled python files.
 
-    .. note:: the default extension for compiled python files has been .pyo for
-        python 2.x-3.4 but as of Python 3.5, the .pyo filename extension is no
-        longer used and has been removed in favour of extension .pyc
+    .. note:: the default extension for compiled python files was .pyo for
+        python 2.x to 3.4 but as of Python 3.5, the .pyo filename extension is
+        no longer used and has been removed in favour of extension .pyc.
     '''
 
     disable_gil = False
-    '''python3.13 experimental free-threading build'''
+    '''python3.13 experimental free threading build'''
 
     def __init__(self, *args, **kwargs):
         self._ctx = None
@@ -221,11 +219,11 @@ class Python3Recipe(TargetPythonRecipe):
         self.ctx.python_recipe = self
 
         # OSpRad local patch: grpmodule.c's getgrall() calls setgrent/getgrent/endgrent,
-        # which bionic gates behind __ANDROID_API__ >= 26 - undeclared and unexported at
-        # this build's API 24 (numpy's recipe minimum), on every NDK version. The `grp`
-        # extension can't be disabled from Setup.local (CPython 3.11's setup.py adds it
-        # unconditionally), and only getgrall() needs those three functions, so patch it
-        # to report unavailable. There is no group database on Android anyway.
+        # which bionic gates behind __ANDROID_API__ >= 26 (undeclared and unexported
+        # at this build's API 24, numpy recipe minimum, on every NDK version). The
+        # `grp` extension can't be disabled from Setup.local (CPython 3.11's setup.py
+        # adds it unconditionally), and only getgrall() needs those three functions,
+        # so patch it to report unavailable. There is no group database on Android.
         grpmodule_c = join(self.get_build_dir(arch.arch), 'Modules', 'grpmodule.c')
         with open(grpmodule_c) as fileh:
             source = fileh.read()
@@ -263,7 +261,7 @@ class Python3Recipe(TargetPythonRecipe):
         elif old_body not in source:
             raise BuildInterruptingException(
                 "OSpRad local patch: grpmodule.c's getgrall() body didn't match "
-                "the expected CPython 3.11.13 source - grp.h/CPython source may "
+                "the expected CPython 3.11.13 source. grp.h/CPython source may "
                 "have changed, patch needs updating."
             )
         else:
@@ -318,7 +316,7 @@ class Python3Recipe(TargetPythonRecipe):
         info('Activating flags for libffi')
         recipe = Recipe.get_recipe('libffi', self.ctx)
         # In order to force the correct linkage for our libffi library, we
-        # set the following variable to point where is our libffi.pc file,
+        # set the following variable to point where our libffi.pc file is,
         # because the python build system uses pkg-config to configure it.
         env['PKG_CONFIG_LIBDIR'] = recipe.get_build_dir(arch.arch)
         add_flags(' -I' + ' -I'.join(recipe.get_include_dirs(arch)),
@@ -339,9 +337,9 @@ class Python3Recipe(TargetPythonRecipe):
                           recipe.get_library_ldflags(arch),
                           recipe.get_library_libs_flag())
 
-        # python build system contains hardcoded zlib version which prevents
-        # the build of zlib module, here we search for android's zlib version
-        # and sets the right flags, so python can be build with android's zlib
+        # python build system contains a hardcoded zlib version which prevents
+        # the build of the zlib module. Here we search for android's zlib version
+        # and set the right flags, so python can be built with android's zlib.
         info("Activating flags for android's zlib")
         zlib_lib_path = arch.ndk_lib_dir_versioned
         zlib_includes = self.ctx.ndk.sysroot_include_dir
@@ -509,7 +507,7 @@ class Python3Recipe(TargetPythonRecipe):
             join(self.ctx.bootstrap.dist_dir, 'libs', arch.arch)
         )
 
-        info('Renaming .so files to reflect cross-compile')
+        info('Renaming .so files to reflect cross compile')
         self.reduce_object_file_names(join(dirn, 'site-packages'))
 
         return join(dirn, 'site-packages')

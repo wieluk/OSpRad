@@ -1,4 +1,4 @@
-# Hardware I/O runs on a background QThread (Qt widgets aren't thread-safe); results
+# Hardware I/O runs on a background QThread (Qt widgets aren't thread safe); results
 # come back to the GUI thread via a Signal, which Qt marshals across threads.
 
 from PySide6.QtCore import QThread, Signal
@@ -24,7 +24,7 @@ class Worker(QThread):
 
 
 def wait_for(worker, timeout_ms=10000):
-    """Block until worker finishes, so it isn't destroyed mid-run during shutdown -
+    """Block until worker finishes, so it isn't destroyed mid run during shutdown.
     Qt aborts the process if a running QThread is destroyed (reachable just by closing
     the window during the automatic connect). Bounded because a serial read can block
     far longer than anyone wants to wait on a window close."""

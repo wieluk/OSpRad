@@ -16,9 +16,9 @@ class PyjniusRecipe(PyProjectRecipe):
     extra_build_args = ['--no-isolation', '--skip-dependency-check']
     # OSpRad local patch: qt_jnienv_getter.patch replaces upstream's
     # genericndkbuild_jnienv_getter.patch, because pyjnius has no support for p4a's
-    # "qt" bootstrap at all - the upstream patch calls WebView_AndroidGetJNIEnv(),
-    # which that bootstrap never compiles in. Ours gets the JNIEnv by dlsym'ing Qt's
-    # own QJniEnvironment out of the already-loaded libQt6Core; see its header.
+    # "qt" bootstrap at all. The upstream patch calls WebView_AndroidGetJNIEnv(),
+    # which that bootstrap never compiles in. Ours gets the JNIEnv by dlsym'ing
+    # Qt's own QJniEnvironment out of the already loaded libQt6Core; see its header.
     patches = [
         "use_cython.patch",
         "qt_jnienv_getter.patch",
@@ -36,7 +36,7 @@ class PyjniusRecipe(PyProjectRecipe):
         env['LDSHARED'] = env['CC'] + ' -shared'
         env['LIBLINK'] = 'NOTNONE'
 
-        # NDKPLATFORM is our switch for detecting Android platform, so can't be None
+        # NDKPLATFORM is our switch for detecting Android platform, so can't be None.
         env['NDKPLATFORM'] = "NOTNONE"
         return env
 

@@ -2,14 +2,15 @@
 
 import argparse
 import html
+import logging
 import os
 import shutil
 import sys
 import time
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon, QPixmap, QTextCursor
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFrame,
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                QPushButton, QScrollArea, QScroller, QScrollerProperties,
@@ -21,40 +22,51 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 import analysis
 import calibration
 import datalog
+import file_io
 import plotting
 import serial_io
 import touch
 from _version import __version__
-from calibration_wizard import (CalibrationTransferTab, CosineResponseTab,
-                                LinearisationTab, SensitivityTab, UnitSetupTab, tip,
-                                wrapped_label)
+from calibration_wizard import (WHEEL_ROLE_HELP, CalibrationTransferTab,
+                                CosineResponseTab, LinearisationTab,
+                                SensitivityTab, UnitSetupTab)
+from ui import captioned, collapsible_group, help_button, tip, wrapped_label
+from ui import set_role as _set_role
 from monitor_calibration import MonitorCalibrationTab
 from qt_worker import Worker, wait_for
 
+
+def _user_data_dir():
+    """Per user, always writable fallback (pip install: site packages is often not
+    writable; AppImage: sys.executable sits in a read only, ephemeral FUSE mount)."""
+    if sys.platform == 'win32':
+        root = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    elif sys.platform == 'darwin':
+        root = os.path.expanduser('~/Library/Application Support')
+    else:
+        root = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
+    path = os.path.join(root, 'OSpRad')
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 # Where calibration_data.csv and data.csv live. Resolved against this file so the app
-# behaves the same however it is launched; see pyproject.toml for the py-modules layout
-# that motivates the per-user fallback below.
+# behaves the same however it is launched; see pyproject.toml for the py modules layout
+# that motivates the per user fallback below.
 if getattr(sys, 'frozen', False):
     # __file__ points inside the PyInstaller bundle, which onefile deletes on exit.
-    BASE_DIR = os.path.dirname(sys.executable)
+    _exe_dir = os.path.dirname(sys.executable)
+    BASE_DIR = _exe_dir if os.access(_exe_dir, os.W_OK) else _user_data_dir()
 else:
     _source_dir = os.path.dirname(os.path.abspath(__file__))
     if os.path.exists(os.path.join(_source_dir, 'calibration_data.csv')):
         BASE_DIR = _source_dir
     else:
-        # pip install: no CSV beside __file__, and site-packages is often not writable.
-        if sys.platform == 'win32':
-            _user_data_root = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
-        elif sys.platform == 'darwin':
-            _user_data_root = os.path.expanduser('~/Library/Application Support')
-        else:
-            _user_data_root = os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share')
-        BASE_DIR = os.path.join(_user_data_root, 'OSpRad')
-        os.makedirs(BASE_DIR, exist_ok=True)
+        BASE_DIR = _user_data_dir()
 DATA_FILE = os.path.join(BASE_DIR, 'data.csv')
 CALIBRATION_FILE = os.path.join(BASE_DIR, 'calibration_data.csv')
 
-# First run: seed a writable calibration_data.csv from the read-only bundled copy.
+# First run: seed a writable calibration_data.csv from the read only bundled copy.
 if not os.path.exists(CALIBRATION_FILE):
     if getattr(sys, 'frozen', False):
         _bundled_calibration = os.path.join(getattr(sys, '_MEIPASS', BASE_DIR), 'calibration_data.csv')
@@ -72,20 +84,71 @@ if not os.path.exists(CALIBRATION_FILE):
 # Cap on the scrolling log widget so an unattended "Repeat every (s)" session doesn't
 # grow unboundedly; QPlainTextEdit trims from the top past this.
 # First entry of the port combo; any other entry is a literal port name to connect to.
-PORT_AUTO = 'Auto-detect'
+PORT_AUTO = 'Auto detect'
+
+# How long a close waits for an in flight measurement before forcing through.
+CLOSE_GRACE_SECONDS = 15
+
+# Idle port presence check. 5s not 1s: on Windows comports() is a SetupAPI
+# walk of tens of milliseconds.
+HEARTBEAT_MS = 5000
+
+# How long a measurement runs before the status explains itself.
+MEASURE_SLOW_HINT_SECONDS = 20
 
 LOG_MAX_LINES = 500
 LOG_LEVELS = ('debug', 'info', 'warning', 'error')
 LOG_LEVEL_RANK = {level: i for i, level in enumerate(LOG_LEVELS)}
 LOG_COLORS = {'error': '#d1495b', 'warning': '#e9a23a', 'debug': '#7a7a7a'}
 
-# Hand-rolled replacement for sv_ttk (Tkinter-only); "role" colours match the old styles.
+# Root of the logger tree the non GUI modules log into (serial_io, datalog, ...).
+# They use stdlib logging so they don't have to import the GUI or be handed a callback.
+LOGGER_NAME = 'osprad'
+
+
+class _LogBridge(QObject):
+    """Carries log records from any thread onto the GUI thread.
+
+    Signal.emit is thread safe and Qt queues cross thread connections, so records
+    logged from the measurement worker arrive on the GUI thread before they touch
+    the log widget. A handler calling _log() directly would corrupt QPlainTextEdit.
+    """
+    message = Signal(str, str)
+
+
+class _QtLogHandler(logging.Handler):
+    """Feeds stdlib log records into the Debug tab through _LogBridge."""
+
+    def __init__(self, bridge):
+        super().__init__()
+        self._bridge = bridge
+
+    def emit(self, record):
+        level = record.levelname.lower()
+        # LOG_LEVELS has no 'critical'; fold it into the most severe level it has.
+        self._bridge.message.emit(record.getMessage(),
+                                  'error' if level == 'critical' else level)
+
+# Hand rolled replacement for sv_ttk (Tkinter only); "role" colours match the old styles.
 LIGHT_QSS = """
 QWidget { background-color: #fafafa; color: #1c1c1c; }
 QLineEdit, QPlainTextEdit, QTreeWidget, QComboBox { background-color: #ffffff; }
 QLabel[role="muted"] { color: #7a7a7a; }
 QLabel[role="good"] { color: #2a9d8f; }
 QLabel[role="bad"] { color: #d1495b; }
+QPushButton { background-color: #e6e6e6; border: 1px solid #a0a0a0;
+    border-radius: 4px; padding: 4px 12px; }
+QPushButton:hover { background-color: #dcdcdc; }
+QPushButton:pressed { background-color: #cfcfcf; }
+QPushButton:disabled { color: #a8a8a8; border-color: #d0d0d0; }
+QCheckBox::indicator, QRadioButton::indicator, QGroupBox::indicator {
+    width: 13px; height: 13px; border: 1px solid #7a7a7a; background-color: #ffffff; }
+QRadioButton::indicator { border-radius: 7px; }
+QCheckBox::indicator, QGroupBox::indicator { border-radius: 3px; }
+QCheckBox::indicator:checked, QRadioButton::indicator:checked,
+QGroupBox::indicator:checked { background-color: #2a9d8f; border-color: #2a9d8f; }
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled,
+QGroupBox::indicator:disabled { border-color: #d0d0d0; }
 """
 DARK_QSS = """
 QWidget { background-color: #1c1c1c; color: #fafafa; }
@@ -93,23 +156,107 @@ QLineEdit, QPlainTextEdit, QTreeWidget, QComboBox { background-color: #2b2b2b; c
 QLabel[role="muted"] { color: #9a9a9a; }
 QLabel[role="good"] { color: #2a9d8f; }
 QLabel[role="bad"] { color: #d1495b; }
+QPushButton { background-color: #3a3a3a; border: 1px solid #6a6a6a;
+    border-radius: 4px; padding: 4px 12px; color: #fafafa; }
+QPushButton:hover { background-color: #454545; }
+QPushButton:pressed { background-color: #2f2f2f; }
+QPushButton:disabled { color: #6a6a6a; border-color: #4a4a4a; }
+QCheckBox::indicator, QRadioButton::indicator, QGroupBox::indicator {
+    width: 13px; height: 13px; border: 1px solid #8a8a8a; background-color: #2b2b2b; }
+QRadioButton::indicator { border-radius: 7px; }
+QCheckBox::indicator, QGroupBox::indicator { border-radius: 3px; }
+QCheckBox::indicator:checked, QRadioButton::indicator:checked,
+QGroupBox::indicator:checked { background-color: #2a9d8f; border-color: #2a9d8f; }
+QCheckBox::indicator:disabled, QRadioButton::indicator:disabled,
+QGroupBox::indicator:disabled { border-color: #4a4a4a; }
 """
 
 
-def _set_role(label, role):
-    label.setProperty('role', role)
-    label.style().unpolish(label)
-    label.style().polish(label)
+# QSettings keys. Nothing used to persist, so every launch started light themed at
+# log level "info" with the port re detected from scratch.
+SETTING_DARK_MODE = 'ui/dark_mode'
+SETTING_LOG_LEVEL = 'log/level'
+SETTING_PORT = 'serial/preferred_port'
+SETTING_MEASURE_TIMEOUT = 'serial/measure_timeout'
+
+
+def _settings():
+    return QSettings()
+
+
+def _get_setting(key, default, type_=str):
+    # type= matters: some backends return every stored value as a string, so a bool
+    # would come back as 'false', which is truthy.
+    try:
+        return _settings().value(key, default, type=type_)
+    except Exception:
+        return default
+
+
+def _set_setting(key, value):
+    try:
+        _settings().setValue(key, value)
+    except Exception:
+        pass  # a remembered preference is never worth failing over
+
+
+class _MeasureOutcome:
+    """What the measurement worker hands back to the GUI thread.
+
+    An object rather than an exception because Worker.failed carries only str(exc),
+    which loses the distinction between a dead USB link (connection is gone) and a
+    calibration problem (connection is fine).
+    """
+
+    def __init__(self, ok, mode, error=None, dead=False, measurement=None, calib=None,
+                 flux=None, luminance=None, peak=None, fwhm=None, chroma=None,
+                 int_time=None, scans=None, pushed_time=False, pushed_scans=False):
+        self.ok = ok
+        self.mode = mode
+        self.error = error
+        self.dead = dead
+        self.measurement = measurement
+        self.calib = calib
+        self.flux = flux
+        self.luminance = luminance
+        self.peak = peak
+        self.fwhm = fwhm
+        self.chroma = chroma
+        self.int_time = int_time
+        self.scans = scans
+        self.pushed_time = pushed_time
+        self.pushed_scans = pushed_scans
+
+
+COL_WHEN, COL_LABEL, COL_MODE, COL_LUMINANCE = range(4)
+
+
+class _ReadingItem(QTreeWidgetItem):
+    """History row that sorts its luminance column numerically.
+
+    QTreeWidgetItem compares columns as text, which orders 9e-05 above 1200. Useless
+    for the one column people actually want to rank by.
+    """
+
+    def __lt__(self, other):
+        tree = self.treeWidget()
+        column = tree.sortColumn() if tree is not None else COL_WHEN
+        if column == COL_LUMINANCE:
+            try:
+                return float(self.text(column)) < float(other.text(column))
+            except ValueError:
+                pass  # blank luminance (no calibration); fall through to text order
+        return self.text(column) < other.text(column)
 
 
 def _make_scroll_tab(content):
     """Wrap a tab in a QScrollArea (so a tall tab scrolls instead of clipping) with
-    QScroller panning so a single-finger touch drag works on phone screens.
+    QScroller panning so a single finger touch drag works on phone screens.
 
     Vertical only. Tabs are laid out to fit the width, so any horizontal movement is
-    just drift - which takes both turning the scrollbar off (content is then sized to
+    just drift, which takes both turning the scrollbar off (content is then sized to
     the viewport width) and turning off QScroller's horizontal overshoot, since the
-    kinetic scroller rubber-bands sideways even with nothing to scroll to.
+    kinetic scroller rubber bands sideways even with nothing to scroll to.
     """
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
@@ -126,10 +273,22 @@ def _make_scroll_tab(content):
     return scroll
 
 
+class _PlotToolbar(NavigationToolbar2QT):
+    """The matplotlib toolbar without its Save button.
+
+    Its save calls figure.savefig(path) directly, which cannot write to an Android
+    content:// URI and so produced 0 byte files there. The app's own "Save figure..."
+    goes through file_io instead, and one save route per plot avoids two buttons
+    that behave differently. Filtering by name rather than index so a matplotlib
+    update that reorders the toolbar can't silently drop the wrong tool.
+    """
+    toolitems = [item for item in NavigationToolbar2QT.toolitems if item[0] != 'Save']
+
+
 def _fit_width(widget):
-    """Let a widget be squeezed below its natural width instead of forcing the whole tab
-    wider than the screen. Used for the matplotlib toolbars, whose row of buttons is
-    wider than a phone in portrait."""
+    """Let a widget be squeezed below its natural width instead of forcing the whole
+    tab wider than the screen. Used for the matplotlib toolbars, whose row of buttons
+    is wider than a phone in portrait."""
     widget.setSizePolicy(QSizePolicy.Policy.Ignored, widget.sizePolicy().verticalPolicy())
     return widget
 
@@ -138,14 +297,21 @@ class OSpRadApp(QMainWindow):
     def __init__(self, port=None):
         super().__init__()
         self.setWindowTitle('OSpRad %s' % __version__)
-        # Conservative small-phone-portrait floor; each tab also scrolls if its
+        # Conservative small phone portrait floor; each tab also scrolls if its
         # content is still taller than this (see _make_scroll_tab).
         self.setMinimumSize(320, 480)
 
-        # Pre-selects the port combo built in _build_main_tab; None means auto-detect.
+        # Pre selects the port combo built in _build_main_tab; None means auto detect.
         self._initial_port = port
 
-        self.dark_mode = False
+        # Read before _build_ui: the plots are constructed with dark=self.dark_mode, so
+        # restoring the theme afterwards would leave them on the wrong palette.
+        self.dark_mode = _get_setting(SETTING_DARK_MODE, False, bool)
+        # Held here rather than read off a widget: _log runs before the Settings tab
+        # exists, and during shutdown after it is gone.
+        self._log_level = _get_setting(SETTING_LOG_LEVEL, 'info')
+        if self._log_level not in LOG_LEVELS:
+            self._log_level = 'info'
         self.connection = None
         self.store = calibration.CalibrationStore(CALIBRATION_FILE)
         self.measurement = None
@@ -155,14 +321,44 @@ class OSpRadApp(QMainWindow):
 
         self._repeat_running = False
         self._repeat_next_time = None
+        self._repeat_queue = []
+        self._repeat_interval_secs = 300
 
         self._prev_int_time = None
         self._prev_scans = None
         self._compared_offsets = set()
+        self._saved_labels = set()
+        # Whether the current reading has already been written to the history, so
+        # Save can grey out after use without _update_controls turning it back on.
+        self._reading_saved = False
+        # Guards _update_controls against running mid construction, when the widgets
+        # from later tabs don't exist yet.
+        self._ui_ready = False
         self._connect_worker = None
         self._connect_port = None
+        self._measure_worker = None
+        self._measure_done = None
+        self._measure_cancelled = False
+        self._closing = False
+        self._close_deadline = None
+
+        self._missed_port_scans = 0
+        self._heartbeat_timer = QTimer(self)
+        self._heartbeat_timer.setInterval(HEARTBEAT_MS)
+        self._heartbeat_timer.timeout.connect(self._check_connection_alive)
+
+        self._measure_started = 0.0
+        self._measure_label = ''
+        self._measure_tick = QTimer(self)
+        self._measure_tick.setInterval(1000)
+        self._measure_tick.timeout.connect(self._update_measure_status)
+
+        self._countdown_timer = QTimer(self)
+        self._countdown_timer.setInterval(1000)
+        self._countdown_timer.timeout.connect(self._update_repeat_countdown)
 
         self._build_ui()
+        self._install_log_bridge()
         self._apply_theme()
         self._load_saved_readings()
         QTimer.singleShot(100, self._connect)
@@ -175,14 +371,29 @@ class OSpRadApp(QMainWindow):
         tabs.addTab(_make_scroll_tab(self._build_monitor_cal_tab()), 'Monitor calibration')
         tabs.addTab(_make_scroll_tab(self._build_calibration_tab()), 'Calibration')
         tabs.addTab(_make_scroll_tab(self._build_debug_tab()), 'Debug')
+        tabs.addTab(_make_scroll_tab(self._build_settings_tab()), 'Settings')
+        self._ui_ready = True
+        self._refresh_log_level_hint()
+        self._update_controls()
+
+    def _hardware_tabs(self):
+        """The tabs that hold a connection and their own plot."""
+        return (self.unit_setup_tab, self.linearisation_tab, self.sensitivity_tab,
+                self.cosine_tab, self.transfer_tab, self.monitor_cal_tab)
 
     def _apply_theme(self):
         QApplication.instance().setStyleSheet(DARK_QSS if self.dark_mode else LIGHT_QSS)
         self.plot.apply_theme(self.dark_mode)
         self.history_plot.apply_theme(self.dark_mode)
+        # These four own a plot of their own (and the cosine tab an angle diagram).
+        # Without this they keep the light palette they were constructed with.
+        for widget in (self.linearisation_tab, self.sensitivity_tab,
+                       self.cosine_tab, self.monitor_cal_tab):
+            widget.apply_theme(self.dark_mode)
 
     def _toggle_theme(self, checked):
         self.dark_mode = checked
+        _set_setting(SETTING_DARK_MODE, checked)
         self._apply_theme()
 
     def _build_main_tab(self):
@@ -190,11 +401,12 @@ class OSpRadApp(QMainWindow):
         layout = QVBoxLayout(content)
 
         port_row = QHBoxLayout()
+        port_tip = ('Which serial port to connect to. Auto detect finds the OSpRad by '
+                    'itself; only pick one manually if that finds the wrong device.')
         port_row.addWidget(QLabel('Port'))
+        port_row.addWidget(help_button(port_tip))
         self.port_combo = QComboBox()
-        tip(self.port_combo,
-            'Which serial port to connect to. Auto-detect finds the OSpRad by itself; '
-            'only pick one manually if that finds the wrong device.')
+        tip(self.port_combo, port_tip)
         port_row.addWidget(self.port_combo, 1)
         self.bt_refresh_ports = QPushButton('Refresh')
         self.bt_refresh_ports.clicked.connect(self._refresh_ports)
@@ -215,55 +427,96 @@ class OSpRadApp(QMainWindow):
         separator.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(separator)
 
+        # Two boxes: what the buttons do was previously unlabelled, and Save sat
+        # directly under the measurement buttons with its Label field below it, so
+        # the field that names a reading appeared after the button that saves it.
+        measure_box = QGroupBox('Measurement')
+        measure_layout = QVBoxLayout(measure_box)
+        measure_header = QHBoxLayout()
+        measure_header.addWidget(wrapped_label(
+            'Point the OSpRad at what you want to measure, then choose a mode.'), 1)
+        measure_header.addWidget(help_button(
+            'Radiance: %s\n\nIrradiance: %s'
+            % (WHEEL_ROLE_HELP['R'], WHEEL_ROLE_HELP['I'])))
+        measure_layout.addLayout(measure_header)
+
         self.bt_rad = QPushButton('Radiance')
         self.bt_rad.setMinimumHeight(36)
         self.bt_rad.setEnabled(False)
         self.bt_rad.clicked.connect(lambda: self._measure('r'))
-        layout.addWidget(self.bt_rad)
+        tip(self.bt_rad, WHEEL_ROLE_HELP['R'])
+        measure_layout.addWidget(self.bt_rad)
 
         self.bt_irr = QPushButton('Irradiance')
         self.bt_irr.setMinimumHeight(36)
         self.bt_irr.setEnabled(False)
         self.bt_irr.clicked.connect(lambda: self._measure('i'))
-        layout.addWidget(self.bt_irr)
+        tip(self.bt_irr, WHEEL_ROLE_HELP['I'])
+        measure_layout.addWidget(self.bt_irr)
+
+        # Says what the hardware is doing while a measurement is in flight (see _measure).
+        status_row = QHBoxLayout()
+        self.measure_status_label = wrapped_label('')
+        _set_role(self.measure_status_label, 'muted')
+        status_row.addWidget(self.measure_status_label, 1)
+        self.bt_measure_cancel = QPushButton('Cancel')
+        self.bt_measure_cancel.clicked.connect(self._cancel_measure)
+        tip(self.bt_measure_cancel,
+            'Stop waiting for this measurement. The OSpRad is reset and '
+            'reconnected, which also stops the scan it is part way through.')
+        status_row.addWidget(self.bt_measure_cancel, 0, Qt.AlignmentFlag.AlignTop)
+        self._measure_status_row = (self.measure_status_label, self.bt_measure_cancel)
+        for widget in self._measure_status_row:
+            widget.setVisible(False)
+        measure_layout.addLayout(status_row)
+        layout.addWidget(measure_box)
+
+        save_box = QGroupBox('Save reading')
+        save_layout = QVBoxLayout(save_box)
+        label_row = QHBoxLayout()
+        label_row.addWidget(QLabel('Label'))
+        label_row.addWidget(help_button(
+            'Names the reading in the History tab. Readings are not required to have '
+            'unique labels. If you reuse one, OSpRad asks whether to keep both or '
+            'replace the older reading.'))
+        label_row.addStretch(1)
+        save_layout.addLayout(label_row)
+        self.save_label_edit = QLineEdit()
+        # Typing a label clears a "needs a label" complaint without needing another press.
+        self.save_label_edit.textChanged.connect(lambda _: self._set_save_error(''))
+        save_layout.addWidget(self.save_label_edit)
 
         self.bt_save = QPushButton('Save reading')
         self.bt_save.setMinimumHeight(36)
         self.bt_save.clicked.connect(self._on_save_clicked)
-        tip(self.bt_save, 'Save the current reading to the history, under the label below.')
-        layout.addWidget(self.bt_save)
-
-        layout.addWidget(QLabel('Label'))
-        self.save_label_edit = QLineEdit()
-        # Typing a label clears a "needs a label" complaint without needing another press.
-        self.save_label_edit.textChanged.connect(lambda _: self._set_save_error(''))
-        layout.addWidget(self.save_label_edit)
+        tip(self.bt_save, 'Save the current reading to the history, under the label above.')
+        save_layout.addWidget(self.bt_save)
 
         # Inline rather than a dialog: a modal on a phone hides the very field it is
         # complaining about, and this sits directly under the control that failed.
         self.save_error_label = wrapped_label('')
         _set_role(self.save_error_label, 'bad')
         self.save_error_label.setVisible(False)
-        layout.addWidget(self.save_error_label)
+        save_layout.addWidget(self.save_error_label)
+        layout.addWidget(save_box)
 
         self._refresh_save_button()
 
         settings = QGridLayout()
         settings.setColumnStretch(2, 1)
 
-        int_time_label = QLabel('Integration time (ms), 0 = auto')
+        int_time_label = QLabel('Integration time (ms)')
         self.int_time_edit = QLineEdit('0')
         self.int_time_edit.setFixedWidth(70)
-        int_time_tip = ('Per-scan exposure in milliseconds. 0 (default) lets the firmware '
-                        'auto-expose just below saturation; set a fixed value only when '
-                        'repeated measurements need identical exposure.')
+        int_time_tip = ('Per scan exposure in milliseconds. 0 (the default) lets the '
+                        'firmware auto expose just below saturation; set a fixed value '
+                        'only when repeated measurements need identical exposure.')
         tip(int_time_label, int_time_tip)
         tip(self.int_time_edit, int_time_tip)
-        settings.addWidget(int_time_label, 0, 0)
+        settings.addWidget(captioned(int_time_label, int_time_tip), 0, 0)
         settings.addWidget(self.int_time_edit, 0, 1)
 
         scans_label = QLabel('Scans, min / max')
-        tip(scans_label, 'placeholder')  # overwritten below once scans_tip is defined
         scans_row = QHBoxLayout()
         self.min_scans_edit = QLineEdit('3')
         self.min_scans_edit.setFixedWidth(45)
@@ -273,25 +526,37 @@ class OSpRadApp(QMainWindow):
         scans_row.addWidget(QLabel('/'))
         scans_row.addWidget(self.max_scans_edit)
         scans_row.addStretch(1)
-        scans_tip = ('How many scans the firmware averages into one measurement. The firmware '
-                     'picks a value in this range itself - short exposures need more repeats '
-                     'to fill ~1s of total sampling time.')
+        scans_tip = ('How many scans the firmware averages into one measurement. The '
+                     'firmware picks a value in this range itself. Short exposures need '
+                     'more repeats to fill ~1s of total sampling time.')
         tip(scans_label, scans_tip)
         tip(self.min_scans_edit, scans_tip)
         tip(self.max_scans_edit, scans_tip)
-        settings.addWidget(scans_label, 1, 0)
+        settings.addWidget(captioned(scans_label, scans_tip), 1, 0)
         settings.addLayout(scans_row, 1, 1)
         layout.addLayout(settings)
 
-        repeat_box = QGroupBox('Automatic repeat')
-        repeat_layout = QVBoxLayout(repeat_box)
+        # Collapsible: an occasional feature that otherwise costs permanent vertical
+        # space on a phone. Folded by default.
+        repeat_box, repeat_layout = collapsible_group('Automatic repeat')
+
+        repeat_tip = ('Takes a measurement automatically every N seconds and saves each '
+                      'one to the history under the label from the Save reading box, '
+                      'without asking again.\n\n'
+                      'Tick Irradiance and/or Radiance below to choose what is measured '
+                      'each time, then press Start. Readings all share the same label, '
+                      'so tell them apart by their timestamp in the History tab.')
+        repeat_header = QHBoxLayout()
+        repeat_header.addWidget(wrapped_label(
+            'Measure and save on a timer, unattended.'), 1)
+        repeat_header.addWidget(help_button(repeat_tip))
+        repeat_layout.addLayout(repeat_header)
 
         repeat_row = QHBoxLayout()
-        repeat_row.addWidget(QLabel('Repeat every (s)'))
+        repeat_row.addWidget(QLabel('Every (s)'))
         self.repeat_time_edit = QLineEdit('300')
         self.repeat_time_edit.setFixedWidth(60)
-        tip(self.repeat_time_edit, 'Seconds between automatic measurements; the mode(s) '
-                                   'measured each time come from the checkboxes below.')
+        tip(self.repeat_time_edit, repeat_tip)
         repeat_row.addWidget(self.repeat_time_edit)
         self.bt_repeat_start = QPushButton('Start')
         self.bt_repeat_start.setEnabled(False)
@@ -316,7 +581,9 @@ class OSpRadApp(QMainWindow):
         repeat_modes.setContentsMargins(20, 0, 0, 0)
         measure_label = QLabel('Measure:')
         _set_role(measure_label, 'muted')
-        repeat_modes.addWidget(measure_label)
+        measure_tip = ('Which reading(s) each automatic repeat takes. Tick both to '
+                       'record an Irradiance and a Radiance measurement every interval.')
+        repeat_modes.addWidget(captioned(measure_label, measure_tip))
         self.repeat_irr_check = QCheckBox('Irradiance')
         self.repeat_irr_check.setChecked(True)
         tip(self.repeat_irr_check, 'Take an Irradiance reading on each automatic repeat.')
@@ -336,19 +603,20 @@ class OSpRadApp(QMainWindow):
         self.plot = plotting.SpectrumPlot(dark=self.dark_mode)
         self.plot.on_hover = lambda text: self.cursor_label.setText(text or '')
         plot_layout = QVBoxLayout()
-        toolbar = _fit_width(NavigationToolbar2QT(self.plot.canvas, content))
+        toolbar = _fit_width(_PlotToolbar(self.plot.canvas, content))
         plot_layout.addWidget(toolbar)
         plot_layout.addWidget(self.cursor_label)
         plot_layout.addWidget(self.plot.canvas, 1)
         layout.addLayout(plot_layout, 1)
 
         actions = QHBoxLayout()
-        self.dark_mode_check = QCheckBox('Dark mode')
-        self.dark_mode_check.toggled.connect(self._toggle_theme)
-        actions.addWidget(self.dark_mode_check)
+        # Dark mode lives on the Settings tab now. It is an app wide preference, not
+        # a main tab control, and it was stranded below the plot on a phone.
         actions.addStretch(1)
         save_fig_btn = QPushButton('Save figure...')
-        save_fig_btn.clicked.connect(self._save_figure)
+        # Lambda, not a bare connect: clicked emits a `checked` bool that would
+        # otherwise arrive as the `plot` argument.
+        save_fig_btn.clicked.connect(lambda: self._save_figure(self.plot, 'osprad-plot'))
         actions.addWidget(save_fig_btn)
         layout.addLayout(actions)
 
@@ -361,31 +629,36 @@ class OSpRadApp(QMainWindow):
         grid.setColumnStretch(3, 1)
 
         tips = {
-            'peak': 'Wavelength of the highest intensity. Daylight/white LEDs peak around '
-                    '450-550nm; incandescent bulbs peak further into the red, often >600nm.',
-            'fwhm': 'Width of the main peak at half height. A few nm = single LED/laser line; '
-                    'broad or "n/a" = broadband source like daylight or an incandescent bulb.',
-            'cie_x': 'CIE 1931 chromaticity x (perceived colour, brightness-independent). '
-                    'Daylight ~ (0.31, 0.33); warm incandescent ~ (0.45, 0.41).',
-            'cie_y': 'CIE 1931 chromaticity y - see cie_x above.',
-            'cct': 'Approximate "warmth" in Kelvin. ~2700K = warm/orange (incandescent); '
-                   '~5000-6500K = cool/blue (daylight). Shows "-" for narrow-band light, '
-                   'where CCT is meaningless.',
+            'peak': 'Wavelength of the highest intensity. Daylight/white LEDs peak '
+                    'around 450 to 550nm; incandescent bulbs peak further into the '
+                    'red, often >600nm.',
+            'fwhm': 'Width of the main peak at half height. A few nm = single LED/'
+                    'laser line; broad or "n/a" = broadband source like daylight or '
+                    'an incandescent bulb.',
+            'cie_x': 'CIE 1931 chromaticity x (perceived colour, brightness '
+                     'independent). Daylight ~ (0.31, 0.33); warm incandescent ~ '
+                     '(0.45, 0.41).',
+            'cie_y': 'CIE 1931 chromaticity y. Read together with CIE x: the pair '
+                     'gives the perceived colour independently of brightness. '
+                     'Daylight ~ (0.31, 0.33); warm incandescent ~ (0.45, 0.41).',
+            'cct': 'Approximate "warmth" in Kelvin. ~2700K = warm/orange '
+                   '(incandescent); ~5000 to 6500K = cool/blue (daylight). Shows "-" '
+                   'for narrow band light, where CCT is meaningless.',
         }
 
         self._analysis_labels = {}
         fields = (('peak', 'Peak λ'), ('fwhm', 'FWHM'),
                   ('cie_x', 'CIE x'), ('cie_y', 'CIE y'), ('cct', 'CCT (approx.)'))
         for i, (key, caption) in enumerate(fields):
-            r, c = divmod(i, 2)
+            row, col = divmod(i, 2)
             caption_label = QLabel(caption + ':')
             _set_role(caption_label, 'muted')
-            grid.addWidget(caption_label, r, c * 2)
-            value = QLabel('-')
-            grid.addWidget(value, r, c * 2 + 1)
-            self._analysis_labels[key] = value
             tip(caption_label, tips[key])
+            grid.addWidget(captioned(caption_label, tips[key]), row, col * 2)
+            value = QLabel('-')
             tip(value, tips[key])
+            grid.addWidget(value, row, col * 2 + 1)
+            self._analysis_labels[key] = value
 
         return group
 
@@ -403,7 +676,11 @@ class OSpRadApp(QMainWindow):
         layout.addLayout(header)
 
         self.saved_tree = QTreeWidget()
-        self.saved_tree.setHeaderLabels(['Time', 'Label', 'Mode', 'Lux/cd·m²'])
+        # "When" carries date + time: it sorts chronologically as plain text, and
+        # it surfaces the date, which the index has always carried but never showed.
+        self.saved_tree.setHeaderLabels(['When', 'Label', 'Mode', 'Lux/cd·m²'])
+        self.saved_tree.setSortingEnabled(True)
+        self.saved_tree.sortByColumn(COL_WHEN, Qt.SortOrder.DescendingOrder)
         self.saved_tree.setRootIsDecorated(False)
         self.saved_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
         self.saved_tree.setMaximumHeight(220)
@@ -417,21 +694,31 @@ class OSpRadApp(QMainWindow):
         layout.addWidget(self.saved_tree)
 
         layout.addWidget(wrapped_label(
-            'Double-click (or double-tap) a reading to add it to the comparison plot '
-            'below; again to remove it. Right-click - or press and hold on a touchscreen '
-            '- for more options, including on a multi-selection.'))
+            'Double click (or double tap) a reading to add it to the comparison plot '
+            'below; again to remove it. Right click, or press and hold on a '
+            'touchscreen, for more options, including on a multi selection.'))
 
         self.history_plot = plotting.SpectrumPlot(dark=self.dark_mode)
         plot_layout = QVBoxLayout()
-        toolbar = _fit_width(NavigationToolbar2QT(self.history_plot.canvas, content))
+        toolbar = _fit_width(_PlotToolbar(self.history_plot.canvas, content))
         plot_layout.addWidget(toolbar)
         plot_layout.addWidget(self.history_plot.canvas, 1)
         layout.addLayout(plot_layout, 1)
 
+        # The comparison plot had no export of its own once the toolbar's Save went.
+        history_actions = QHBoxLayout()
+        history_actions.addStretch(1)
+        save_history_fig_btn = QPushButton('Save figure...')
+        save_history_fig_btn.clicked.connect(
+            lambda: self._save_figure(self.history_plot, 'osprad-comparison'))
+        history_actions.addWidget(save_history_fig_btn)
+        layout.addLayout(history_actions)
+
         return content
 
-    # Monitor calibration is a downstream USE of an already-calibrated device, blocked by
-    # MonitorCalibrationTab._start() until the unit is set up - hence a top-level tab.
+    # Monitor calibration is a downstream USE of an already calibrated device,
+    # blocked by MonitorCalibrationTab._start() until the unit is set up, hence a
+    # top level tab.
 
     def _build_monitor_cal_tab(self):
         self.monitor_cal_tab = MonitorCalibrationTab(self.connection, self.store)
@@ -443,11 +730,12 @@ class OSpRadApp(QMainWindow):
         content = QWidget()
         layout = QVBoxLayout(content)
         layout.addWidget(wrapped_label(
-            'One-time setup per unit. Unit number and wheel positions live on the Arduino; '
-            'linearisation and spectral sensitivity live in calibration_data.csv.'))
+            'One time setup per unit. Unit number and wheel positions live on the '
+            'Arduino; linearisation and spectral sensitivity live in '
+            'calibration_data.csv.'))
 
         cal_tabs = QTabWidget()
-        self.unit_setup_tab = UnitSetupTab(self.connection)
+        self.unit_setup_tab = UnitSetupTab(self.connection, self.store)
         self.linearisation_tab = LinearisationTab(self.connection, self.store)
         self.sensitivity_tab = SensitivityTab(self.connection, self.store)
         self.cosine_tab = CosineResponseTab(self.connection, self.store)
@@ -494,13 +782,10 @@ class OSpRadApp(QMainWindow):
         log_label = QLabel('Log')
         _set_role(log_label, 'muted')
         log_header.addWidget(log_label, 1)
-        level_label = QLabel('Level')
-        _set_role(level_label, 'muted')
-        log_header.addWidget(level_label)
-        self.log_level_combo = QComboBox()
-        self.log_level_combo.addItems(LOG_LEVELS)
-        self.log_level_combo.setCurrentText('info')
-        log_header.addWidget(self.log_level_combo)
+        # The level control lives on the Settings tab: one setting, one control.
+        self.log_level_hint = QLabel('')
+        _set_role(self.log_level_hint, 'muted')
+        log_header.addWidget(self.log_level_hint)
         layout.addLayout(log_header)
 
         self.log_text = QPlainTextEdit()
@@ -511,20 +796,31 @@ class OSpRadApp(QMainWindow):
         return content
 
     def _refresh_ports(self):
-        """Repopulate the port combo from a fresh scan, keeping the current selection even
-        if this scan doesn't see it - the device may just be momentarily unplugged."""
-        keep = self.port_combo.currentText() if self.port_combo.count() else \
-            (self._initial_port or PORT_AUTO)
-        self.port_combo.blockSignals(True)
-        self.port_combo.clear()
-        self.port_combo.addItem(PORT_AUTO)
+        """Repopulate the port combo from a fresh scan, keeping the current selection
+        even if this scan doesn't see it. The device may just be momentarily unplugged.
+
+        On the first call nothing is selected yet, so the starting choice comes from
+        --port, else the remembered preferred port, else auto detect.
+        """
+        if self.port_combo.count():
+            keep = self.port_combo.currentText()
+        else:
+            keep = self._initial_port or _get_setting(SETTING_PORT, PORT_AUTO) or PORT_AUTO
         ports = serial_io.list_ports()
-        self.port_combo.addItems(ports)
-        if keep != PORT_AUTO and keep not in ports:
-            self.port_combo.addItem(keep)
-        idx = self.port_combo.findText(keep)
-        self.port_combo.setCurrentIndex(idx if idx >= 0 else 0)
-        self.port_combo.blockSignals(False)
+
+        for combo in (self.port_combo, getattr(self, 'settings_port_combo', None)):
+            if combo is None:
+                continue
+            wanted = keep if combo is self.port_combo else combo.currentText() or keep
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem(PORT_AUTO)
+            combo.addItems(ports)
+            if wanted != PORT_AUTO and wanted not in ports:
+                combo.addItem(wanted)
+            idx = combo.findText(wanted)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
 
     def _selected_port(self):
         text = self.port_combo.currentText()
@@ -534,6 +830,10 @@ class OSpRadApp(QMainWindow):
         # Runs on a background QThread (qt_worker.Worker); blocking the main thread
         # would freeze the UI including the log that's supposed to show progress.
         self.connection = None
+        # A reconnected (or re plugged) unit is back on firmware defaults, so the
+        # cache of what we last pushed is no longer true.
+        self._prev_int_time = None
+        self._prev_scans = None
         self._set_connected(False)
         self._propagate_connection()
         self.bt_connect.setEnabled(False)
@@ -569,12 +869,16 @@ class OSpRadApp(QMainWindow):
     def _connect_succeeded(self, result):
         connection, config = result
         self.connection = connection
-        self._propagate_connection()
+        connection.measure_timeout = self._measure_timeout_setting()
+        self._missed_port_scans = 0
+        self._heartbeat_timer.start()
+        _set_role(self.conn_status_label, 'muted')  # may be 'bad' from a lost connection
+        self._propagate_connection(config)
         self._set_connected(True)
         self.bt_connect.setEnabled(True)
         self.bt_connect.setText('Reconnect')
         # Title (not just the log) so unit/firmware stay visible after later log messages.
-        self.setWindowTitle('OSpRad %s - unit #%d, firmware v%s'
+        self.setWindowTitle('OSpRad %s, unit #%d, firmware v%s'
                             % (__version__, config.unit_number, config.firmware))
         status = ('Connected to unit #%d on %s (firmware v%s)'
                   % (config.unit_number, connection.port, config.firmware))
@@ -618,88 +922,339 @@ class OSpRadApp(QMainWindow):
         self.conn_status_label.setText(text)
         self.debug_status_label.setText(text)
 
-    def _propagate_connection(self):
-        for widget in (self.unit_setup_tab, self.linearisation_tab, self.sensitivity_tab,
-                      self.cosine_tab, self.transfer_tab, self.monitor_cal_tab):
-            widget.set_connection(self.connection)
+    def _propagate_connection(self, config=None):
+        """Push the connection, and the config we already have, into every tab.
+
+        Passing the config down matters: otherwise each of the six tabs would call
+        get_config() itself on connect, which is six extra blocking serial round
+        trips for a number the connect worker has already fetched.
+        """
+        for widget in self._hardware_tabs():
+            widget.set_connection(self.connection, config)
 
     def _set_connected(self, connected):
-        """Grey out hardware-dependent controls while disconnected."""
-        for button in (self.bt_rad, self.bt_irr, self.bt_motor_test):
-            button.setEnabled(connected)
-        # Stop stays enabled so a repeat in progress can still be cancelled mid-run.
-        self.bt_repeat_start.setEnabled(connected and not self._repeat_running)
-        if not connected:
-            self.bt_save.setEnabled(False)
+        """Kept as the name the connect path calls; state lives in _update_controls."""
+        self._update_controls()
 
-    def _measure(self, mode):
+    def _update_controls(self):
+        """Single source of truth for which controls are live.
+
+        Derived in one place from (connected, measuring, repeating, has a reading)
+        because the enabled states used to be set from six different methods, which
+        is exactly how a control ends up greyed out at the wrong moment.
+        """
+        # The main tab is built before the Debug tab, and calls this while building.
+        if not self._ui_ready:
+            return
+        connected = self.connection is not None
+        measuring = self._measure_worker is not None
+        idle = connected and not measuring
+
+        for button in (self.bt_rad, self.bt_irr, self.bt_motor_test):
+            button.setEnabled(idle)
+        self.bt_connect.setEnabled(not measuring)
+        self.bt_repeat_start.setEnabled(idle and not self._repeat_running)
+        # Stop stays live so a repeat can be cancelled even mid measurement.
+        self.bt_repeat_stop.setEnabled(self._repeat_running)
+        self.bt_save.setEnabled(
+            self.reading is not None and not measuring and not self._reading_saved)
+
+    def _check_connection_alive(self):
+        """Notice an unplug while idle.
+
+        Deliberately does not talk to the device: an idle 'g' would inject traffic
+        into a port shared between the measurement worker and five GUI thread tabs,
+        would have to take the busy lock, and could desynchronise reply framing. An
+        unplug removes the port node, so plain enumeration answers the actual
+        question without any I/O to the unit.
+        """
+        if self.connection is None or self._measure_worker is not None or self._closing:
+            return
+        try:
+            present = self.connection.port in serial_io.list_ports()
+        except Exception:
+            return  # enumeration itself failed; try again next tick
+        if present:
+            self._missed_port_scans = 0
+            return
+        # CH340/CDC clones briefly re enumerate on reset, so require two in a row.
+        self._missed_port_scans += 1
+        if self._missed_port_scans >= 2:
+            self._on_connection_lost('USB device %s is no longer present.'
+                                     % self.connection.port)
+
+    def _on_connection_lost(self, reason):
+        """Tear down a connection that has gone away. The app used to keep claiming
+        it was connected after an unplug, with the measure buttons still live."""
+        if self.connection is None:
+            return
+        try:
+            self.connection.close()
+        except Exception:
+            pass
+        self.connection = None
+        self._prev_int_time = None
+        self._prev_scans = None
+        self._heartbeat_timer.stop()
+        self._missed_port_scans = 0
+        if self._repeat_running:
+            self._stop_repeat()
+            self._log('Automatic repeat stopped; the OSpRad was disconnected.',
+                      level='error')
+        self._propagate_connection()
+        self._update_controls()
+        self.setWindowTitle('OSpRad %s' % __version__)
+        self.sensor_verdict_label.setText('? Optical sensor: unknown')
+        _set_role(self.sensor_verdict_label, 'muted')
+        self.sensor_detail_label.setText('')
+        message = '%s Plug the OSpRad back in, then press Reconnect.' % reason
+        self._update_conn_labels(message)
+        _set_role(self.conn_status_label, 'bad')
+        self._log(message, level='error')
+
+    def _set_measure_status(self, text):
+        self.measure_status_label.setText(text)
+        for widget in self._measure_status_row:
+            widget.setVisible(bool(text))
+        if text:
+            # Only offer Cancel while there is something to cancel.
+            self.bt_measure_cancel.setEnabled(
+                self._measure_worker is not None and not self._measure_cancelled)
+
+    def _read_measure_settings(self):
+        """Parse the measurement settings on the GUI thread.
+
+        Returns (int_time, n_min, n_max, push_time, push_scans) or raises ValueError.
+        The old code did these int() calls mid measurement, where a ValueError
+        escaped the except clause entirely and took the measurement down with a
+        traceback. The _prev_* cache is deliberately not updated here. That happens
+        only once the commands have actually landed, so a failed push can't poison it.
+        """
+        try:
+            int_time = int(self.int_time_edit.text())
+        except ValueError as exc:
+            raise ValueError(
+                'integration time must be a whole number of milliseconds') from exc
+        if int_time < 0:
+            raise ValueError('integration time cannot be negative')
+        try:
+            n_min = max(1, int(self.min_scans_edit.text()))
+            n_max = min(50, int(self.max_scans_edit.text()))
+        except ValueError as exc:
+            raise ValueError('scan counts must be whole numbers') from exc
+        if n_max < n_min:
+            n_max = n_min
+        return (int_time, n_min, n_max,
+                int_time != self._prev_int_time, (n_min, n_max) != self._prev_scans)
+
+    def _measure(self, mode, on_done=None):
+        """Start a measurement on a background thread.
+
+        on_done(ok) fires on the GUI thread when it finishes, however it finishes.
+        That continuation is what lets repeat mode chain measurements instead of
+        blocking. Measuring used to run on the GUI thread, so the window froze for
+        the whole serial round trip (up to 90s x 3 retries on a dead unit) with no
+        way to show what it was doing.
+        """
+        if self._measure_worker is not None:
+            return  # already in flight; the buttons are greyed out
         if self.connection is None:
             self._log('Not connected to an OSpRad.', level='error')
+            self._finish_measure(False, on_done)
             return
-        self._log('-> measure(%r)' % mode, level='debug')
         try:
-            self._push_settings()
-            measurement = self.connection.measure(mode)
-            calib = self.store.get(measurement.unit_number)
-        except (serial_io.SpecError, calibration.CalibrationError) as exc:
-            self._log(str(exc), level='error')
+            settings = self._read_measure_settings()
+        except ValueError as exc:
+            self._log('Check the measurement settings: %s' % exc, level='error')
+            self._finish_measure(False, on_done)
             return
-        self._log('<- n_scans=%d int_time=%dms saturated=%s'
-                  % (measurement.n_scans, measurement.int_time, measurement.saturated),
-                  level='debug')
 
-        flux = calib.to_flux(measurement.raw_counts, mode, measurement.int_time)
-        luminance = calib.luminance(flux)
-        unit = 'lux' if mode == 'i' else 'cd/sqm'
-        amount = f'{luminance:.3f}' if luminance > 0.1 else f'{luminance:.3e}'
+        self._measure_done = on_done
+        self._measure_cancelled = False
+        self._measure_label = 'irradiance' if mode == 'i' else 'radiance'
+        self._measure_started = time.time()
 
-        title = ('%s   Int.: %dms   Scans: %d   %s %s'
-                 % ('Irradiance' if mode == 'i' else 'Radiance', measurement.int_time,
-                    measurement.n_scans, amount, unit))
-        self.plot.add_curve('live', calib.wavelength, flux, mode=mode, title=title, style='live')
-        self._update_analysis(calib.wavelength, flux, calib)
+        worker = Worker(self._do_measure, mode, self.connection, self.store, settings)
+        worker.succeeded.connect(self._measure_succeeded)
+        # Backstop: without it an unexpected exception would leave the buttons grey.
+        worker.failed.connect(self._measure_crashed)
+        # Assigned before the first status update: Cancel's enabled state keys off
+        # it, so drawing the status first left the button dead until the next tick.
+        self._measure_worker = worker
+        self._update_controls()
+        self._update_measure_status()
+        self._measure_tick.start()
+        worker.start()
+
+    def _do_measure(self, mode, connection, store, settings):
+        """Background thread: hardware I/O plus the maths on its result.
+
+        Returns an outcome rather than raising, because Worker.failed only carries
+        str(exc) and item 7 needs to tell a dead USB link from a calibration problem.
+        The flux/luminance/chromaticity work is 288 element pure Python looping run
+        three or four times per measurement, so it belongs off the GUI thread too.
+        """
+        int_time, n_min, n_max, push_time, push_scans = settings
+        try:
+            if push_time:
+                connection.set_integration_time(int_time)
+            if push_scans:
+                connection.set_scan_range(n_min, n_max)
+            measurement = connection.measure(mode)
+            calib = store.get(measurement.unit_number)
+            flux = calib.to_flux(measurement.raw_counts, mode, measurement.int_time)
+            luminance = calib.luminance(flux)
+            peak = analysis.peak_wavelength(calib.wavelength, flux)
+            fwhm = analysis.fwhm(calib.wavelength, flux)
+            chroma = calib.chromaticity(flux)
+        except serial_io.SpecTimeoutError:
+            return _MeasureOutcome(
+                ok=False, mode=mode,
+                error='The OSpRad did not finish this measurement within %d minutes.\n\n'
+                      'In near darkness the firmware uses its longest exposure, which '
+                      'takes several minutes. If the scene really is that dark, set a '
+                      'fixed integration time instead of 0 (auto) to bound how long '
+                      'a measurement can take.'
+                      % (serial_io.MEASURE_TIMEOUT // 60))
+        except (serial_io.SpecError, calibration.CalibrationError) as exc:
+            return _MeasureOutcome(
+                ok=False, mode=mode, error=str(exc),
+                dead=isinstance(exc, serial_io.SpecTransportError))
+        return _MeasureOutcome(
+            ok=True, mode=mode, measurement=measurement, calib=calib, flux=flux,
+            luminance=luminance, peak=peak, fwhm=fwhm, chroma=chroma,
+            int_time=int_time, scans=(n_min, n_max),
+            pushed_time=push_time, pushed_scans=push_scans)
+
+    def _measure_succeeded(self, outcome):
+        if not outcome.ok:
+            # A cancel unblocks the read, which surfaces as a timeout. Reporting
+            # that as an error would blame the unit for something the user asked for.
+            if not self._measure_cancelled:
+                self._log(outcome.error, level='error')
+                if outcome.dead:
+                    self._on_connection_lost(outcome.error)
+            self._finish_measure(False)
+            return
+
+        # Only now that the commands have actually landed is the cache valid.
+        if outcome.pushed_time:
+            self._prev_int_time = outcome.int_time
+        if outcome.pushed_scans:
+            self._prev_scans = outcome.scans
+
+        measurement, calib = outcome.measurement, outcome.calib
+        mode = outcome.mode
+        unit = 'lux' if mode == 'i' else 'cd/m\N{SUPERSCRIPT TWO}'
+        amount = (f'{outcome.luminance:.3f}' if outcome.luminance > 0.1
+                  else f'{outcome.luminance:.3e}')
+        # The reading leads; the exposure settings sit in the smaller right hand title.
+        title = ('%s   %s %s'
+                 % ('Irradiance' if mode == 'i' else 'Radiance', amount, unit))
+        subtitle = ('unit #%d   %s   %d ms \N{MULTIPLICATION SIGN} %d scans'
+                    % (measurement.unit_number, time.strftime('%H:%M:%S'),
+                       measurement.int_time, measurement.n_scans))
+        if measurement.saturated:
+            # Worth surfacing on the plot: saturated photosites mean the peak is
+            # clipped, so the shape and the reading are both suspect.
+            subtitle += '   %g saturated' % measurement.saturated
+        self.plot.add_curve('live', calib.wavelength, outcome.flux, mode=mode,
+                            title=title, subtitle=subtitle, style='live')
+        self._show_analysis(outcome)
         self._log('Unit #%d   saturated photosites: %s'
                   % (measurement.unit_number, measurement.saturated))
 
         self.measurement = measurement
-        self.reading = datalog.format_measurement(mode, measurement, flux, luminance, calib.wavelength)
-        self._last_luminance = luminance
+        self.reading = datalog.format_measurement(mode, measurement, outcome.flux,
+                                                  outcome.luminance, calib.wavelength)
+        self._last_luminance = outcome.luminance
+        self._reading_saved = False
+        self._finish_measure(True)
+
+    def _measure_crashed(self, message):
+        self._log('Measurement failed unexpectedly: %s' % message, level='error')
+        self._finish_measure(False)
+
+    def _cancel_measure(self):
+        """Stop waiting for a measurement, and put the link back in a known state.
+
+        Cancelling is not just "ignore the result": the unit carries on scanning
+        and will send its DATA line minutes later, which would be read as the reply
+        to whatever command came next. Reopening the port resets the Nano and aborts
+        the scan, so a reconnect is the resync, and it is quick next to the up to
+        7 minute measurement being abandoned.
+        """
+        if self._measure_worker is None or self._measure_cancelled:
+            return
+        self._measure_cancelled = True
+        self.bt_measure_cancel.setEnabled(False)
+        self._measure_tick.stop()
+        self._set_measure_status('Cancelling...')
+        self._log('Cancelling the measurement.', level='warning')
+        if self._repeat_running:
+            # The chain's continuation is dropped below, so leaving repeat "running"
+            # would strand it with nothing scheduled.
+            self._stop_repeat()
+        if self.connection is not None:
+            # Unblocks the worker's read; the reconnect below is what actually stops
+            # the unit scanning.
+            self.connection.cancel_read()
+
+    def _update_measure_status(self):
+        """Tick the elapsed time, and say why a dark scene takes so long.
+
+        "Measuring radiance..." on its own gave no way to tell a working long
+        exposure from a hang. In near darkness the firmware really does take
+        minutes, moving the shutter wheel for every one of its scans.
+        """
+        elapsed = int(time.time() - self._measure_started)
+        text = 'Measuring %s... %d:%02d' % (self._measure_label, elapsed // 60, elapsed % 60)
+        if elapsed >= MEASURE_SLOW_HINT_SECONDS:
+            text += ('\nDim light needs long exposures, so this can take several '
+                     'minutes. Press Cancel to stop waiting.')
+        self._set_measure_status(text)
+
+    def _finish_measure(self, ok, on_done=None):
+        """Single exit point for every path: success, device error, crash, cancel."""
+        self._measure_worker = None
+        self._measure_tick.stop()
+        self._set_measure_status('')
+        if self._measure_cancelled:
+            self._measure_cancelled = False
+            self._log('Measurement cancelled; reconnecting to stop the scan.')
+            self._refresh_save_button()
+            self._connect()
+            # Nothing downstream should treat a cancel as a finished measurement.
+            self._measure_done = None
+            return
         self._refresh_save_button()
+        self._update_controls()
+        # Cleared before the call: repeat mode starts the next measurement from
+        # inside this callback, and that measurement's continuation must not be
+        # overwritten.
+        callback = on_done if on_done is not None else self._measure_done
+        self._measure_done = None
+        if callback is not None:
+            callback(ok)
 
-    def _update_analysis(self, wavelength, flux, calib):
-        peak = analysis.peak_wavelength(wavelength, flux)
-        fw = analysis.fwhm(wavelength, flux)
-        self._analysis_labels['peak'].setText('%.1f nm' % peak)
+    def _show_analysis(self, outcome):
+        """Render numbers the worker already computed. No maths on the GUI thread."""
+        self._analysis_labels['peak'].setText('%.1f nm' % outcome.peak)
         self._analysis_labels['fwhm'].setText(
-            ('%.1f nm' % fw) if fw is not None else 'n/a (broadband)')
-
-        chroma = calib.chromaticity(flux)
-        if chroma is not None:
-            x, y = chroma
-            cct = calibration.cct_from_xy(x, y)
+            ('%.1f nm' % outcome.fwhm) if outcome.fwhm is not None else 'n/a (broadband)')
+        if outcome.chroma is not None:
+            x, y = outcome.chroma
             self._analysis_labels['cie_x'].setText('%.4f' % x)
             self._analysis_labels['cie_y'].setText('%.4f' % y)
-            self._analysis_labels['cct'].setText(('%.0f K' % cct) if cct is not None else '-')
+            cct = calibration.cct_from_xy(x, y)
+            self._analysis_labels['cct'].setText(('%d K' % round(cct)) if cct else '-')
         else:
-            self._analysis_labels['cie_x'].setText('-')
-            self._analysis_labels['cie_y'].setText('-')
-            self._analysis_labels['cct'].setText('-')
+            for key in ('cie_x', 'cie_y', 'cct'):
+                self._analysis_labels[key].setText('-')
 
-    def _push_settings(self):
-        int_time = int(self.int_time_edit.text())
-        if int_time != self._prev_int_time:
-            self.connection.set_integration_time(int_time)
-            self._prev_int_time = int_time
-            self._log('-> integration time %dms' % int_time, level='debug')
-
-        n_min = max(1, int(self.min_scans_edit.text()))
-        n_max = min(50, int(self.max_scans_edit.text()))
-        if n_max < n_min:
-            n_max = n_min
-        if (n_min, n_max) != self._prev_scans:
-            self.connection.set_scan_range(n_min, n_max)
-            self._prev_scans = (n_min, n_max)
-            self._log('-> scan range %d-%d' % (n_min, n_max), level='debug')
+    def _clear_analysis(self):
+        for label in self._analysis_labels.values():
+            label.setText('-')
 
     def _set_save_error(self, message, role='bad'):
         """Inline complaint under the Save button; an empty message hides it."""
@@ -711,50 +1266,106 @@ class OSpRadApp(QMainWindow):
         """Save is only live once there is something to save. Rather than leave a dead
         grey control with no explanation, say what is missing."""
         has_reading = self.reading is not None
-        self.bt_save.setEnabled(has_reading)
+        self._update_controls()
         if has_reading:
-            self._set_save_error('')
+            if not self._reading_saved:
+                self._set_save_error('')
         else:
             self._set_save_error(
-                'No reading yet - take a Radiance or Irradiance measurement first.',
+                'No reading yet; take a Radiance or Irradiance measurement first.',
                 role='muted')
 
     def _on_save_clicked(self):
-        """Validation lives here rather than in _save() because repeat mode calls _save()
-        directly - an unattended session must not stall waiting for someone to type a
-        label."""
+        """Validation and prompting live here rather than in _save(), because repeat
+        mode calls _save() directly. An unattended run must never stall on a modal,
+        and its deliberate label reuse must not trigger the duplicate prompt."""
         if self.reading is None:
-            self._set_save_error('No reading to save - take a measurement first.')
+            self._set_save_error('No reading to save; take a measurement first.')
             return
-        if not self.save_label_edit.text().strip():
+        label = self.save_label_edit.text().strip()
+        if not label:
             self._set_save_error('Enter a label before saving this reading.')
             self.save_label_edit.setFocus()
             return
         self._set_save_error('')
-        self._save()
 
-    def _save(self):
+        if label in self._saved_labels:
+            existing = [e.offset for e in datalog.iter_index(DATA_FILE)
+                        if e.label.strip() == label]
+            if existing and not self._resolve_duplicate(label, existing):
+                return
+        self._save(label)
+
+    def _resolve_duplicate(self, label, existing):
+        """Ask what to do about a label already in the history.
+
+        Returns True to go ahead with the save. "Save anyway" is the default because
+        replacing deletes rows, and deleting shifts every later byte offset, the keys
+        the History tab identifies readings by.
+        """
+        box = QMessageBox(self)
+        box.setWindowTitle('OSpRad')
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText('%d saved reading%s already labelled "%s".'
+                    % (len(existing), ' is' if len(existing) == 1 else 's are', label))
+        box.setInformativeText('Keep both, or replace the older one?')
+        save_btn = box.addButton('Save anyway', QMessageBox.ButtonRole.AcceptRole)
+        replace_btn = box.addButton('Replace', QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(save_btn)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is replace_btn:
+            try:
+                datalog.delete_readings(DATA_FILE, existing)
+            except OSError as exc:
+                self._set_save_error('Could not replace the older reading: %s' % exc)
+                return False
+            # Deleting rows shifts every later offset, so every cached offset, and
+            # every plotted curve keyed by one, is now stale.
+            self._clear_history_plot()
+            self._load_saved_readings()
+            return True
+        return clicked is save_btn
+
+    def _save(self, label=None):
         if self.reading is None:
             return
         settings, data, wavelength = self.reading
-        label = self.save_label_edit.text()
+        if label is None:
+            label = self.save_label_edit.text().strip()
         offset = datalog.append_reading(DATA_FILE, label, self.measurement.unit_number,
                                         settings, data, wavelength)
-        self.bt_save.setEnabled(False)
-        stamp = time.strftime('%H:%M:%S')
+        self._reading_saved = True
+        self._update_controls()
+        stamp = time.strftime('%Y-%m-%d %H:%M:%S')
         luminance_text = f'{self._last_luminance:.3g}' if self._last_luminance is not None else ''
-        item = QTreeWidgetItem([stamp, label or '(unlabelled)', self.measurement.mode, luminance_text])
-        item.setData(0, Qt.ItemDataRole.UserRole, offset)
-        self.saved_tree.insertTopLevelItem(0, item)
+        item = _ReadingItem([stamp, label or '(unlabelled)', self.measurement.mode,
+                             luminance_text])
+        item.setData(COL_WHEN, Qt.ItemDataRole.UserRole, offset)
+        # The view owns the ordering now, so append rather than forcing this to the top.
+        self.saved_tree.addTopLevelItem(item)
+        if label:
+            self._saved_labels.add(label)
+        # The button just went grey with no explanation before.
+        self._set_save_error('Saved as "%s".' % (label or '(unlabelled)'), role='muted')
         self._log('Saved reading "%s"' % (label or '(unlabelled)'))
 
     def _load_saved_readings(self):
         self.saved_tree.clear()
+        self._saved_labels = set()
+        # Each insert re sorts while sorting is live, so bulk load with it off.
+        self.saved_tree.setSortingEnabled(False)
         for entry in datalog.iter_index(DATA_FILE):
-            item = QTreeWidgetItem([entry.time, entry.label or '(unlabelled)', entry.mode,
-                                    f'{entry.luminance:.3g}'])
-            item.setData(0, Qt.ItemDataRole.UserRole, entry.offset)
+            item = _ReadingItem(['%s %s' % (entry.date, entry.time),
+                                 entry.label or '(unlabelled)', entry.mode,
+                                 f'{entry.luminance:.3g}'])
+            item.setData(COL_WHEN, Qt.ItemDataRole.UserRole, entry.offset)
             self.saved_tree.addTopLevelItem(item)
+            if entry.label.strip():
+                self._saved_labels.add(entry.label.strip())
+        self.saved_tree.setSortingEnabled(True)
 
     def _on_saved_double_click(self, item, column):
         offset = item.data(0, Qt.ItemDataRole.UserRole)
@@ -773,8 +1384,8 @@ class OSpRadApp(QMainWindow):
             self._log(str(exc), level='error')
             return
         label_text = reading.label or '%s %s' % (reading.date, reading.time)
-        # The plot's y-axis label reflects only the first curve added (see
-        # SpectrumPlot._redraw), so tag each curve's mode in its legend - radiance
+        # The plot's y axis label reflects only the first curve added (see
+        # SpectrumPlot._redraw), so tag each curve's mode in its legend. Radiance
         # and irradiance are different physical units.
         mode_tag = 'radiance' if reading.mode == 'r' else 'irradiance'
         self.history_plot.add_curve(offset, calib.wavelength, reading.flux, mode=reading.mode,
@@ -790,7 +1401,7 @@ class OSpRadApp(QMainWindow):
         self.history_plot.clear_curves()
         self._compared_offsets.clear()
 
-    # History tab: right-click (or, on a touchscreen, long-press) menu
+    # History tab: right click (or, on a touchscreen, long press) menu
 
     def _on_saved_context_menu(self, pos):
         item = self.saved_tree.itemAt(pos)
@@ -803,8 +1414,8 @@ class OSpRadApp(QMainWindow):
         menu.exec(self.saved_tree.viewport().mapToGlobal(pos))
 
     def _build_saved_menu(self):
-        """Built separately from _on_saved_context_menu so the contents can be checked
-        without opening a modal menu."""
+        """Built separately from _on_saved_context_menu so the contents can be
+        checked without opening a modal menu."""
         selection = self.saved_tree.selectedItems()
         single = len(selection) == 1
         menu = QMenu(self)
@@ -819,8 +1430,8 @@ class OSpRadApp(QMainWindow):
         return menu
 
     def _show_only_selected_reading(self):
-        """Replace whatever is on the comparison plot with just this reading - the
-        common case of "show me that one", which otherwise took a Clear then a Compare."""
+        """Replace whatever is on the comparison plot with just this reading. The
+        common case of "show me that one", which otherwise took a Clear then Compare."""
         selection = self.saved_tree.selectedItems()
         if len(selection) != 1:
             return
@@ -873,7 +1484,7 @@ class OSpRadApp(QMainWindow):
         except OSError as exc:
             self._log(str(exc), level='error')
             return
-        # Deleting rows shifts every later row's byte offset - same as in rename.
+        # Deleting rows shifts every later row's byte offset. Same as in rename.
         self._clear_history_plot()
         self._load_saved_readings()
         self._log('Deleted %d reading%s' % (count, '' if count == 1 else 's'))
@@ -882,26 +1493,36 @@ class OSpRadApp(QMainWindow):
         items = self.saved_tree.selectedItems()
         if not items:
             return
-        offsets = [item.data(0, Qt.ItemDataRole.UserRole) for item in items]
-        path, _ = QFileDialog.getSaveFileName(
-            self, 'OSpRad', os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), ''),
-            'CSV file (*.csv)')
+        offsets = [item.data(COL_WHEN, Qt.ItemDataRole.UserRole) for item in items]
+        path, _ = file_io.ask_save_path(
+            self, file_io.default_name('osprad-readings', 'csv'), 'CSV file (*.csv)')
         if not path:
             return
         try:
-            datalog.export_readings(DATA_FILE, offsets, path)
+            file_io.write_text(path, datalog.export_text(DATA_FILE, offsets))
         except OSError as exc:
             self._log(str(exc), level='error')
             return
         self._log('Exported %d reading%s to %s'
                   % (len(offsets), '' if len(offsets) == 1 else 's', path))
 
-    def _save_figure(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, 'OSpRad', os.path.join(os.path.dirname(os.path.abspath(DATA_FILE)), ''),
+    def _save_figure(self, plot=None, stem='osprad-plot'):
+        plot = plot or self.plot
+        path, selected = file_io.ask_save_path(
+            self, file_io.default_name(stem, 'png'),
             'PNG image (*.png);;PDF document (*.pdf)')
-        if path:
-            self.plot.save_as_image(path)
+        if not path:
+            return
+        # A content:// URI has no usable suffix, so the chosen filter decides the format.
+        fmt = file_io.extension_for(selected, path, default='png')
+        if fmt not in ('png', 'pdf'):
+            fmt = 'png'
+        try:
+            plot.save_as_image(path, fmt)
+        except (OSError, ValueError) as exc:
+            self._log('Could not save the figure: %s' % exc, level='error')
+            return
+        self._log('Saved figure to %s' % path)
 
     def _start_repeat(self):
         if self._repeat_running or self.connection is None:
@@ -917,8 +1538,9 @@ class OSpRadApp(QMainWindow):
             self._log('Repeat interval must be a whole number of seconds.', level='error')
             return
         self._repeat_running = True
-        self.bt_repeat_start.setEnabled(False)
-        self.bt_repeat_stop.setEnabled(True)
+        self._repeat_interval_secs = max(1, int(self.repeat_time_edit.text()))
+        self._update_controls()
+        self._countdown_timer.start()
         self._log('Automatic repeat started.')
         QTimer.singleShot(50, self._repeat_tick)
 
@@ -927,60 +1549,290 @@ class OSpRadApp(QMainWindow):
             return
         self._repeat_running = False
         self._repeat_next_time = None
-        self.bt_repeat_start.setEnabled(self.connection is not None)
-        self.bt_repeat_stop.setEnabled(False)
+        self._repeat_queue = []
+        self._countdown_timer.stop()
+        self._update_controls()
         self.repeat_status_label.setText('Not running.')
         self._log('Automatic repeat stopped.')
 
+    def _repeat_interval(self):
+        """The interval, falling back to the last good value.
+
+        Editing the field to something non numeric mid run used to raise inside a
+        timer callback and kill the repeat silently.
+        """
+        try:
+            value = int(self.repeat_time_edit.text())
+            if value < 1:
+                raise ValueError
+        except ValueError:
+            self._log('Repeat interval is not a whole number of seconds; keeping %ds.'
+                      % self._repeat_interval_secs, level='warning')
+            return self._repeat_interval_secs
+        self._repeat_interval_secs = value
+        return value
+
+    # Repeat is a chain rather than a loop: each measurement now completes on a worker
+    # thread, so the next step has to be started from its completion callback.
     def _repeat_tick(self):
-        # Every continuation below is guarded by _repeat_running, so a singleShot that
-        # still fires after Stop was pressed is a harmless no-op.
+        if not self._repeat_running:
+            return  # a singleShot that outlived Stop is a harmless no op
+        self._repeat_queue = [mode for mode, check in (('i', self.repeat_irr_check),
+                                                       ('r', self.repeat_rad_check))
+                              if check.isChecked()]
+        self._repeat_step()
+
+    def _repeat_step(self):
         if not self._repeat_running:
             return
-        if self.repeat_irr_check.isChecked():
-            self._measure('i')
-            self._save()
-        if self.repeat_rad_check.isChecked():
-            self._measure('r')
-            self._save()
+        if self.connection is None:
+            self._stop_repeat()
+            self._log('Automatic repeat stopped; the OSpRad was disconnected.',
+                      level='error')
+            return
+        if not self._repeat_queue:
+            self._schedule_next_tick()
+            return
+        self._measure(self._repeat_queue.pop(0), on_done=self._repeat_measure_done)
+
+    def _repeat_measure_done(self, ok):
         if not self._repeat_running:
-            return  # Stop may have fired during the _measure()/_save() calls above
-        interval = max(1, int(self.repeat_time_edit.text()))
+            return  # Stop was pressed while that measurement was in flight
+        if ok:
+            self._save(self.save_label_edit.text().strip())
+        self._repeat_step()
+
+    def _schedule_next_tick(self):
+        interval = self._repeat_interval()
         self._repeat_next_time = time.time() + interval
         QTimer.singleShot(interval * 1000, self._repeat_tick)
-        self._update_repeat_countdown()
 
     def _update_repeat_countdown(self):
+        """Driven by one persistent timer. It used to re arm itself and be re invoked
+        every tick, leaving one extra 1 second chain alive per tick."""
         if not self._repeat_running or self._repeat_next_time is None:
             return
         remaining = max(0, round(self._repeat_next_time - time.time()))
         mins, secs = divmod(int(remaining), 60)
         self.repeat_status_label.setText('Next measurement in %d:%02d' % (mins, secs))
-        QTimer.singleShot(1000, self._update_repeat_countdown)
+
+    def _build_settings_tab(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+
+        appearance = QGroupBox('Appearance')
+        appearance_layout = QVBoxLayout(appearance)
+        self.dark_mode_check = QCheckBox('Dark mode')
+        self.dark_mode_check.setChecked(self.dark_mode)
+        self.dark_mode_check.toggled.connect(self._toggle_theme)
+        appearance_layout.addWidget(self.dark_mode_check)
+        layout.addWidget(appearance)
+
+        logging_box = QGroupBox('Logging')
+        logging_layout = QHBoxLayout(logging_box)
+        level_tip = ('How much detail the Debug tab records. "debug" adds the full '
+                     'serial conversation with the OSpRad; the right setting when '
+                     'reporting a problem.')
+        logging_layout.addWidget(QLabel('Log level'))
+        logging_layout.addWidget(help_button(level_tip))
+        self.log_level_combo = QComboBox()
+        self.log_level_combo.addItems(LOG_LEVELS)
+        self.log_level_combo.setCurrentText(self._log_level)
+        self.log_level_combo.currentTextChanged.connect(self._on_log_level_changed)
+        logging_layout.addWidget(self.log_level_combo)
+        logging_layout.addStretch(1)
+        layout.addWidget(logging_box)
+
+        connection = QGroupBox('Connection')
+        connection_layout = QVBoxLayout(connection)
+        port_tip = ('The port to select automatically at startup. "%s" re detects the '
+                    'OSpRad each time, which is usually right; pin a port only if '
+                    'auto detect keeps finding the wrong device.' % PORT_AUTO)
+        port_row = QHBoxLayout()
+        port_row.addWidget(QLabel('Preferred port'))
+        port_row.addWidget(help_button(port_tip))
+        self.settings_port_combo = QComboBox()
+        tip(self.settings_port_combo, port_tip)
+        self.settings_port_combo.currentTextChanged.connect(self._on_preferred_port_changed)
+        port_row.addWidget(self.settings_port_combo, 1)
+        refresh = QPushButton('Refresh')
+        refresh.clicked.connect(self._refresh_ports)
+        port_row.addWidget(refresh)
+        connection_layout.addLayout(port_row)
+        layout.addWidget(connection)
+
+        measurement = QGroupBox('Measurement')
+        measurement_layout = QVBoxLayout(measurement)
+        timeout_tip = (
+            'How long to wait for one measurement before giving up.\n\n'
+            'In near darkness the firmware uses its longest exposure and takes a dark '
+            'scan for every light scan, so a single reading can genuinely run for '
+            'about six minutes. Below roughly %d seconds such a reading can never '
+            'finish. Raise it if you measure very dim scenes; lower it if you would '
+            'rather a stuck unit gave up quickly.'
+            % serial_io.MEASURE_TIMEOUT)
+        timeout_row = QHBoxLayout()
+        timeout_row.addWidget(QLabel('Measurement timeout (s)'))
+        timeout_row.addWidget(help_button(timeout_tip))
+        self.measure_timeout_edit = QLineEdit(str(self._measure_timeout_setting()))
+        self.measure_timeout_edit.setFixedWidth(70)
+        tip(self.measure_timeout_edit, timeout_tip)
+        self.measure_timeout_edit.editingFinished.connect(self._on_measure_timeout_changed)
+        timeout_row.addWidget(self.measure_timeout_edit)
+        timeout_row.addStretch(1)
+        measurement_layout.addLayout(timeout_row)
+        self.measure_timeout_note = wrapped_label('')
+        _set_role(self.measure_timeout_note, 'muted')
+        measurement_layout.addWidget(self.measure_timeout_note)
+        layout.addWidget(measurement)
+
+        data = QGroupBox('Data folder')
+        data_layout = QVBoxLayout(data)
+        # Where readings and calibration land resolves three different ways (source
+        # checkout, pip install, read only AppImage), so show which one is in effect.
+        data_layout.addWidget(wrapped_label(
+            'Readings (data.csv) and calibration data are stored here.'))
+        path_row = QHBoxLayout()
+        path_edit = QLineEdit(BASE_DIR)
+        path_edit.setReadOnly(True)
+        path_row.addWidget(path_edit, 1)
+        copy_btn = QPushButton('Copy')
+        copy_btn.clicked.connect(
+            lambda: QApplication.clipboard().setText(BASE_DIR))
+        path_row.addWidget(copy_btn)
+        data_layout.addLayout(path_row)
+        layout.addWidget(data)
+
+        footer = wrapped_label('Settings are saved automatically.')
+        _set_role(footer, 'muted')
+        layout.addWidget(footer)
+        layout.addStretch(1)
+        return content
+
+    def _on_log_level_changed(self, level):
+        self._log_level = level
+        _set_setting(SETTING_LOG_LEVEL, level)
+        self._refresh_log_level_hint()
+
+    def _refresh_log_level_hint(self):
+        self.log_level_hint.setText('Level: %s (change on the Settings tab)'
+                                    % self._log_level)
+
+    def _measure_timeout_setting(self):
+        value = _get_setting(SETTING_MEASURE_TIMEOUT, serial_io.MEASURE_TIMEOUT, int)
+        return max(serial_io.MEASURE_TIMEOUT_MIN,
+                   min(serial_io.MEASURE_TIMEOUT_MAX, int(value)))
+
+    def _on_measure_timeout_changed(self):
+        """Validate, clamp, persist, and apply to the live connection."""
+        text = self.measure_timeout_edit.text().strip()
+        try:
+            value = int(text)
+        except ValueError:
+            self.measure_timeout_note.setText(
+                'Not a number; keeping %ds.' % self._measure_timeout_setting())
+            _set_role(self.measure_timeout_note, 'bad')
+            self.measure_timeout_edit.setText(str(self._measure_timeout_setting()))
+            return
+
+        clamped = max(serial_io.MEASURE_TIMEOUT_MIN,
+                      min(serial_io.MEASURE_TIMEOUT_MAX, value))
+        _set_setting(SETTING_MEASURE_TIMEOUT, clamped)
+        # Applied live, so a change does not need a reconnect to take effect.
+        if self.connection is not None:
+            self.connection.measure_timeout = clamped
+        self.measure_timeout_edit.setText(str(clamped))
+        if clamped != value:
+            self.measure_timeout_note.setText(
+                'Clamped to %d to %ds.' % (serial_io.MEASURE_TIMEOUT_MIN,
+                                           serial_io.MEASURE_TIMEOUT_MAX))
+            _set_role(self.measure_timeout_note, 'bad')
+        elif clamped < serial_io.MEASURE_TIMEOUT:
+            self.measure_timeout_note.setText(
+                'Below %ds, a measurement in near darkness cannot finish.'
+                % serial_io.MEASURE_TIMEOUT)
+            _set_role(self.measure_timeout_note, 'bad')
+        else:
+            self.measure_timeout_note.setText('')
+
+    def _on_preferred_port_changed(self, port):
+        _set_setting(SETTING_PORT, port)
+        # Apply straight away so the next Connect uses it without a restart.
+        if getattr(self, 'port_combo', None) is not None and \
+                self.port_combo.currentText() != port:
+            index = self.port_combo.findText(port)
+            if index >= 0:
+                self.port_combo.setCurrentIndex(index)
+
+    def _install_log_bridge(self):
+        """Route the non GUI modules' stdlib logging into the Debug tab's log widget.
+
+        Called after _build_ui so log_text and log_level_combo exist. The handler is
+        attached at DEBUG and left there: the Level combo filters inside _log, so
+        changing it needs no logger reconfiguration and the stdout/logcat mirror
+        always sees everything.
+        """
+        self._log_bridge = _LogBridge()
+        self._log_bridge.message.connect(self._log)
+        logger = logging.getLogger(LOGGER_NAME)
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False  # don't also print through the root logger
+        # Idempotent: a second window (or a re run under a test driver) must not
+        # double every line.
+        for existing in [h for h in logger.handlers if isinstance(h, _QtLogHandler)]:
+            logger.removeHandler(existing)
+        logger.addHandler(_QtLogHandler(self._log_bridge))
 
     def _log(self, text, level='info'):
-        # Mirror to stdout before the level filter: p4a routes stdout into logcat, which
-        # is the only way any of this reaches an Android bug report.
+        # Mirror to stdout before the level filter: p4a routes stdout into logcat,
+        # which is the only way any of this reaches an Android bug report.
         print('OSpRad[%s] %s' % (level, text), flush=True)
 
-        if LOG_LEVEL_RANK.get(level, 1) < LOG_LEVEL_RANK.get(self.log_level_combo.currentText(), 1):
-            return  # below the Debug tab's Level selector
+        if LOG_LEVEL_RANK.get(level, 1) < LOG_LEVEL_RANK.get(self._log_level, 1):
+            return  # below the level chosen on the Settings tab
         stamp = time.strftime('%H:%M:%S')
         line = '[%s] %s' % (stamp, text)
-        color = LOG_COLORS.get(level)
-        if color:
-            self.log_text.appendHtml('<span style="color:%s">%s</span>' % (color, html.escape(line)))
-        else:
-            self.log_text.appendPlainText(line)
+        # Always an explicit colour, never appendPlainText: a plain append inherits
+        # the character format of the previous line, so every info line after an
+        # error came out red.
+        color = LOG_COLORS.get(level) or ('#fafafa' if self.dark_mode else '#1c1c1c')
+        self.log_text.appendHtml('<span style="color:%s">%s</span>'
+                                 % (color, html.escape(line)))
         cursor = self.log_text.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         self.log_text.setTextCursor(cursor)
         self.log_text.ensureCursorVisible()
 
     def closeEvent(self, event):
-        # Both run hardware I/O on background QThreads; see qt_worker.wait_for for why.
+        self._closing = True
+        self._stop_repeat()
+        self._countdown_timer.stop()
+        self._measure_tick.stop()
+        self._heartbeat_timer.stop()
+
+        # A measurement can block for serial_io's full 90s timeout, and Qt aborts
+        # the process if a running QThread is destroyed. Keep the window alive and
+        # retry rather than calling wait_for() on the GUI thread, which would look
+        # like a hang.
+        if self._measure_worker is not None and self._measure_worker.isRunning():
+            if self._close_deadline is None:
+                self._close_deadline = time.time() + CLOSE_GRACE_SECONDS
+            if time.time() < self._close_deadline:
+                self._set_measure_status(
+                    'Finishing the current measurement before closing...')
+                event.ignore()
+                QTimer.singleShot(250, self.close)
+                return
+
+        # These run hardware I/O on background QThreads; see qt_worker.wait_for for why.
+        wait_for(self._measure_worker)
         wait_for(self._connect_worker)
         wait_for(self.monitor_cal_tab.worker)
+        if self.connection is not None:
+            try:
+                self.connection.close()   # never closed before; leaked the port until exit
+            except Exception:
+                pass
         super().closeEvent(event)
 
 
@@ -1000,9 +1852,10 @@ def _parse_args(argv):
     parser = argparse.ArgumentParser(prog='OSpRad')
     parser.add_argument(
         '--port', default=None,
-        help='Serial port to connect to, e.g. COM5 or /dev/ttyUSB0. Overrides the GUI\'s '
-             'port selector on startup. Default: auto-detect (same as the GUI).')
-    # parse_known_args so a Qt flag (-style, -platform, ...) ahead of ours doesn't error out.
+        help='Serial port to connect to, e.g. COM5 or /dev/ttyUSB0. Overrides the '
+             'GUI\'s port selector on startup. Default: auto detect (same as the GUI).')
+    # parse_known_args so a Qt flag (style, platform, ...) typed ahead of ours
+    # doesn't error out.
     args, _unknown = parser.parse_known_args(argv)
     return args
 
@@ -1010,9 +1863,13 @@ def _parse_args(argv):
 def main():
     args = _parse_args(sys.argv[1:])
     app = QApplication(sys.argv)
+    # Must be set before any QSettings is constructed, or the storage location is
+    # platform dependent guesswork and settings appear not to persist.
+    app.setOrganizationName('OSpRad')
+    app.setApplicationName('OSpRad')
     app.setWindowIcon(_app_icon())
-    # There is no hovering on a touchscreen, so the tooltips scattered through the app
-    # would otherwise be unreachable there. Bound to the app so it outlives this scope.
+    # There is no hovering on a touchscreen, so the tooltips scattered through the
+    # app would otherwise be unreachable there. Bound to the app so it outlives this scope.
     app._touch_tooltips = touch.enable_touch_tooltips(app)
     window = OSpRadApp(port=args.port)
     window.show()

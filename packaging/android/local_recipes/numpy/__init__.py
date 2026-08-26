@@ -9,15 +9,15 @@ class NumpyRecipe(MesonRecipe):
     version = 'v2.3.0'
     url = 'git+https://github.com/numpy/numpy'
     # OSpRad local patch, shared by every vendored recipe here: under this pinned p4a
-    # commit an inherited PYTHONPATH breaks `python -m build`'s isolated venv
-    # (BackendUnavailable), and `build`'s own dependency check falsely reports satisfied
-    # requirements as missing. Both are worked around with --no-isolation
-    # --skip-dependency-check, which then makes each recipe responsible for
-    # pre-installing its own [build-system] requires. For numpy those are its meson-python
-    # backend and meson-python's own patchelf.
+    # commit, an inherited PYTHONPATH breaks `python -m build`'s isolated venv
+    # (BackendUnavailable), and `build`'s own dependency check falsely reports
+    # satisfied requirements as missing. Both are worked around with
+    # --no-isolation --skip-dependency-check, which then makes each recipe
+    # responsible for pre-installing its own [build-system] requires. For numpy
+    # those are its meson-python backend and meson-python's own patchelf.
     hostpython_prerequisites = [
         "Cython>=3.0.6", "numpy", "meson-python>=0.15.0", "patchelf>=0.11.0",
-    ]  # meson does not detects venv's cython
+    ]  # meson does not detect venv's cython
     extra_build_args = [
         '-Csetup-args=-Dblas=none', '-Csetup-args=-Dlapack=none',
         '--no-isolation', '--skip-dependency-check',
@@ -27,8 +27,8 @@ class NumpyRecipe(MesonRecipe):
 
     def get_recipe_meson_options(self, arch):
         options = super().get_recipe_meson_options(arch)
-        # Custom python is required, so that meson
-        # gets libs and config files properly
+        # Custom python is required, so that meson gets libs and config files
+        # properly.
         options["binaries"]["python"] = self.ctx.python_recipe.python_exe
         options["binaries"]["python3"] = self.ctx.python_recipe.python_exe
         options["properties"]["longdouble_format"] = "IEEE_DOUBLE_LE" if arch.arch in ["armeabi-v7a", "x86"] else "IEEE_QUAD_LE"
@@ -37,11 +37,11 @@ class NumpyRecipe(MesonRecipe):
     def get_recipe_env(self, arch, **kwargs):
         env = super().get_recipe_env(arch, **kwargs)
 
-        # _PYTHON_HOST_PLATFORM declares that we're cross-compiling
-        # and avoids issues when building on macOS for Android targets.
+        # _PYTHON_HOST_PLATFORM declares that we're cross-compiling and avoids
+        # issues when building on macOS for Android targets.
         env["_PYTHON_HOST_PLATFORM"] = arch.command_prefix
 
-        # NPY_DISABLE_SVML=1 allows numpy to build for non-AVX512 CPUs
+        # NPY_DISABLE_SVML=1 allows numpy to build for non-AVX512 CPUs.
         # See: https://github.com/numpy/numpy/issues/21196
         env["NPY_DISABLE_SVML"] = "1"
         env["TARGET_PYTHON_EXE"] = join(Recipe.get_recipe(

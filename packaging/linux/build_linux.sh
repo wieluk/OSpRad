@@ -41,10 +41,10 @@ EOF
 else
     tar -C "$DIST_DIR" -czf "$DIST_DIR/OSpRad-linux-x86_64.tar.gz" OSpRad
     cat <<EOF
-appimagetool not found on PATH - built a plain tarball instead:
+appimagetool not found on PATH. Built a plain tarball instead:
   $DIST_DIR/OSpRad-linux-x86_64.tar.gz
 Extract it and run the OSpRad binary inside the extracted OSpRad/ folder.
-For an AppImage with desktop-menu integration, install appimagetool
+For an AppImage with desktop menu integration, install appimagetool
 (https://github.com/AppImage/appimagetool) and re-run this script.
 EOF
 fi

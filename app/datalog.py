@@ -1,14 +1,17 @@
 import collections
 import csv
 import io
+import logging
 import os
 import time
 
 from calibration import PIXELS
 
-# data.csv layout - fixed, 588 fields per row (0-indexed):
+log = logging.getLogger('osprad.datalog')
+
+# data.csv layout: fixed, 588 fields per row (0 indexed):
 #   0:label 1:unit# 2:date 3:time 4:mode 5:intTime 6:nScans 7:saturated
-#   8:luminance-label 9:luminance 10:flux-unit-label 11..298:flux (288 values)
+#   8:luminance label 9:luminance 10:flux unit label 11..298:flux (288 values)
 #   299:"rawCounts:" 300..587:rawCounts (288 values)
 IDX_LABEL = 0
 IDX_UNIT = 1
@@ -34,7 +37,7 @@ SavedReading = collections.namedtuple(
 
 def format_measurement(mode, measurement, flux, luminance, wavelength):
     """Bundle everything needed to write one reading: settings row, data row, and
-    the wavelength axis used for the CSV header (round-tripped via append_reading)."""
+    the wavelength axis used for the CSV header (round tripped via append_reading)."""
     counts = [f'{c:.4f}' for c in measurement.raw_counts]
     flux_fields = [f'{flux[0]:.4f}'] + [f'{f:.4e}' for f in flux[1:]]
 
@@ -56,7 +59,7 @@ def _header_row(wavelength):
 
 
 def append_reading(path, label, unit_number, settings, data, wavelength):
-    """Appends one reading row to path (writing a header first if the file is new/empty).
+    """Appends one reading row to path (writing a header first if the file is new or empty).
 
     Returns the byte offset of the row just written, so callers can index straight back
     to it (via load_reading) without rescanning the file.
@@ -72,12 +75,13 @@ def append_reading(path, label, unit_number, settings, data, wavelength):
                 time.strftime('%H:%M:%S', t)] + settings + data)
         offset = handle.tell()
         writer.writerow(row)
+    log.debug('Appended reading %r for unit %s at offset %d', label, unit_number, offset)
     return offset
 
 
 def iter_index(path):
-    """Yield a ReadingIndex per saved reading in path, cheapest-possible (parses only
-    the first ~10 fields; never the 576 flux/raw-count fields). Safe when path doesn't
+    """Yield a ReadingIndex per saved reading in path, cheapest possible (parses only
+    the first ~10 fields; never the 576 flux/raw count fields). Safe when path doesn't
     exist yet (yields nothing)."""
     if not os.path.exists(path):
         return
@@ -103,11 +107,11 @@ def iter_index(path):
                     int_time=int(row[IDX_INT_TIME]), n_scans=int(row[IDX_N_SCANS]),
                     saturated=float(row[IDX_SATURATED]), luminance=float(row[IDX_LUMINANCE]))
             except ValueError:
-                continue  # corrupted/truncated row
+                continue  # corrupted or truncated row
 
 
 def _rewrite_rows(path, transform):
-    """Rewrite path line-by-line via a temp file (atomic rename at the end), calling
+    """Rewrite path line by line via a temp file (atomic rename at the end), calling
     transform(offset, raw_line) -> new_line_or_None on every line. None drops the line."""
     tmp_path = path + '.tmp'
     with open(path, 'r', newline='') as src, open(tmp_path, 'w', newline='') as dst:
@@ -124,8 +128,9 @@ def _rewrite_rows(path, transform):
 
 def delete_readings(path, offsets):
     """Remove the reading rows at the given byte offsets (as yielded by iter_index()).
-    Rows after a deleted one shift to new offsets - callers must treat every previously
+    Rows after a deleted one shift to new offsets. Callers must treat every previously
     known offset as invalid once this returns."""
+    log.info('Deleting %d reading(s) from %s', len(set(offsets)), path)
     offsets = set(offsets)
     _rewrite_rows(path, lambda offset, line: None if offset in offsets else line)
 
@@ -144,18 +149,26 @@ def rename_reading(path, offset, new_label):
     _rewrite_rows(path, transform)
 
 
-def export_readings(path, offsets, dest_path):
-    """Copy the header plus the reading rows at the given offsets to a new CSV file,
-    preserving full precision (flux and raw counts included)."""
+def export_text(path, offsets):
+    """Return the header plus the reading rows at the given offsets as CSV text,
+    preserving full precision (flux and raw counts included).
+
+    Returns text rather than writing a file so the caller can route it through
+    file_io, which is what makes the export work on Android.
+    """
     offsets = set(offsets)
-    with open(path, 'r', newline='') as src, open(dest_path, 'w', newline='') as dst:
+    out = []
+    with open(path, 'r', newline='') as src:
         while True:
             offset = src.tell()
             line = src.readline()
             if not line:
                 break
             if offset == 0 or offset in offsets:
-                dst.write(line)
+                out.append(line)
+    log.debug('exported %d of %d requested rows from %s', max(0, len(out) - 1),
+              len(offsets), path)
+    return ''.join(out)
 
 
 def load_reading(path, offset):

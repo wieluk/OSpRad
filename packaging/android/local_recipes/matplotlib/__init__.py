@@ -11,14 +11,15 @@ class MatplotlibRecipe(PyProjectRecipe):
     patches = ["skip_macos.patch"]
     depends = ['kiwisolver', 'numpy', 'pillow', 'setuptools', 'freetype']
     # OSpRad note: python-dateutil imports `six` at runtime, which matplotlib's Qt
-    # backend therefore needs - but `six` must NOT be listed here. It is also a real p4a
-    # recipe, pulled in by pyjnius's recipe-level depends, and p4a asserts that no name
-    # is both a recipe and a pymodule. If pyjnius ever leaves --requirements, add it back.
+    # backend therefore needs. But `six` must NOT be listed here. It is also a real
+    # p4a recipe, pulled in by pyjnius's recipe level depends, and p4a asserts that
+    # no name is both a recipe and a pymodule. If pyjnius ever leaves --requirements,
+    # add it back.
     python_depends = ['cycler', 'fonttools', 'packaging', 'pyparsing', 'python-dateutil']
     need_stl_shared = True
     # OSpRad local patch (see local_recipes/numpy/__init__.py for why): matplotlib's own
     # [build-system] requires, plus the isolation flags. numpy here is a normal host
-    # build for headers, unrelated to the cross-compiled Android numpy recipe.
+    # build for headers, unrelated to the cross compiled Android numpy recipe.
     hostpython_prerequisites = [
         "certifi", "pybind11>=2.6", "setuptools_scm>=7", "numpy>=2.0.0rc1,<2.3",
     ]
@@ -26,20 +27,19 @@ class MatplotlibRecipe(PyProjectRecipe):
 
     def generate_libraries_pc_files(self, arch):
         """
-        Create *.pc files for libraries that `matplotib` depends on.
+        Create *.pc files for libraries that matplotlib depends on.
 
-        Because, for unix platforms, the mpl install script uses `pkg-config`
-        to detect libraries installed in non standard locations (our case...
-        well...we don't even install the libraries...so we must trick a little
-        the mlp install).
+        For unix platforms, the mpl install script uses `pkg-config` to
+        detect libraries installed in non standard locations (our case;
+        we don't even install the libraries, so we must trick the install
+        a little).
         """
         pkg_config_path = self.get_recipe_env(arch)['PKG_CONFIG_PATH']
         ensure_dir(pkg_config_path)
 
         lib_to_pc_file = {
-            # `pkg-config` search for version freetype2.pc, our current
-            # version for freetype, but we have our recipe named without
-            # the version...so we add it in here for our pc file
+            # `pkg-config` looks for freetype2.pc, but our recipe is named
+            # without the version, so we add it in here for our pc file.
             'freetype': 'freetype2.pc',
         }
 
@@ -75,16 +75,15 @@ class MatplotlibRecipe(PyProjectRecipe):
     def get_recipe_env(self, arch, **kwargs):
         env = super().get_recipe_env(arch, **kwargs)
 
-        # we make use of the same directory than `XDG_CACHE_HOME`, for our
-        # custom library pc files, so we have all the install files that we
-        # generate at the same place
+        # we use the same directory as `XDG_CACHE_HOME` for our custom library
+        # pc files, so all the install files we generate live in one place.
         env['XDG_CACHE_HOME'] = join(self.get_build_dir(arch), 'p4a_files')
         env['PKG_CONFIG_PATH'] = env['XDG_CACHE_HOME']
 
         # creating proper *.pc files for our libraries does not seem enough to
-        # success with our build (without depending on system development
-        # libraries), but if we tell the compiler where to find our libraries
-        # and includes, then the install success :)
+        # succeed with our build (without depending on system development
+        # libraries), but telling the compiler where to find our libraries and
+        # includes makes the install succeed.
         freetype = self.get_recipe('freetype', self.ctx)
         free_lib_dir = join(freetype.get_build_dir(arch.arch), 'objs', '.libs')
         free_inc_dir = join(freetype.get_build_dir(arch.arch), 'include')
@@ -93,14 +92,14 @@ class MatplotlibRecipe(PyProjectRecipe):
         # OSpRad local patch: also add to CPPFLAGS, not just CFLAGS. Under
         # --no-isolation, matplotlib's setup.py (via distutils/setuptools)
         # compiles its C++ extensions (ft2font.cpp) reading CPPFLAGS for include
-        # paths, not CFLAGS - confirmed by `fatal error: 'ft2build.h' file not
-        # found` even with the CFLAGS addition above in place; the isolated-venv
+        # paths, not CFLAGS. Confirmed by `fatal error: 'ft2build.h' file not
+        # found` even with the CFLAGS addition above in place. The isolated venv
         # build path this recipe originally targeted apparently didn't hit this
         # (or found freetype via pkg-config instead), but --no-isolation does.
         env['CPPFLAGS'] += f' -I{free_inc_dir}'
 
-        # `freetype` could be built with `harfbuzz` support,
-        # so we also include the necessary flags...just to be sure
+        # `freetype` may have been built with `harfbuzz` support, so include
+        # the necessary flags too, just to be sure.
         if 'harfbuzz' in self.ctx.recipe_build_order:
             harfbuzz = self.get_recipe('harfbuzz', self.ctx)
             harf_build = harfbuzz.get_build_dir(arch.arch)

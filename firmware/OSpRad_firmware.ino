@@ -1,15 +1,7 @@
 
 /*
  * OSpRad firmware
- *
- * For the Arduino Nano. Tested with Elegoo units and unbranded clones; use the
- * "old bootloader 328p" option if normal upload fails.
- * Inspired by https://impfs.github.io/review/
- * C12880MA datasheet: https://www.farnell.com/datasheets/2822646.pdf
- *
- * Commands are newline-terminated, one per line (see loop()); replies are
- * type-prefixed - "OK,..." / "ERR,<reason>" / "CFG,..." / "DATA,..." / "DIAG,..."
- * - and DATA lines carry a trailing checksum so a truncated reply can be retried.
+ * For the Arduino Nano
  * The app must share this firmware's major version.
  */
 

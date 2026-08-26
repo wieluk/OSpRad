@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build macOS OSpRad.app via PyInstaller. Must run on macOS - PyInstaller doesn't cross-compile.
+# Build macOS OSpRad.app via PyInstaller. Must run on macOS. PyInstaller doesn't cross compile.
 #
 # Usage: packaging/macos/build_macos.sh
 # Requires: pip install -r app/requirements.txt pyinstaller

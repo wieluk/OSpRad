@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=OSpRad
-Comment=Open-source spectroradiometer control app
+Comment=Open source spectroradiometer control app
 Exec=OSpRad
 Icon=ospradicon
 Categories=Science;Education;

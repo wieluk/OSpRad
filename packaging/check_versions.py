@@ -1,6 +1,6 @@
 # Checks that app/_version.py and the firmware sketch agree on major version.
 #
-# app/_version.py is just a placeholder between releases - the release version comes
+# app/_version.py is just a placeholder between releases. The release version comes
 # from the git tag, which package.yml's prepare job stamps into every build artifact.
 # App and firmware are released together and must share a major version, but the
 # firmware only changes on reflash, so only the major needs to match.
@@ -40,8 +40,8 @@ def main():
 
     errors = []
     if app.split('.')[0] != firmware.split('.')[0]:
-        errors.append('app %s and firmware %s have different major versions - a 3.x app '
-                      'cannot talk to 2.x firmware' % (app, firmware))
+        errors.append('app %s and firmware %s have different major versions. A 3.x app '
+                      'cannot talk to 2.x firmware.' % (app, firmware))
 
     for error in errors:
         print('ERROR: %s' % error, file=sys.stderr)

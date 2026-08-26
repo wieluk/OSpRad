@@ -1,11 +1,12 @@
 # Unit setup and calibration tabs, embedded in the main window's Calibration tab.
-# Each tab is a self-contained QWidget built once at startup and kept alive for
-# the app's lifetime; set_connection() handles the connection going from None to a
-# real SerialConnection and back across a Reconnect.
+# Each tab is a self contained QWidget built once at startup and kept alive for
+# the app's lifetime. set_connection() handles the connection going from None to
+# a real SerialConnection and back across a Reconnect.
 
+import logging
 import math
 
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QSize
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFileDialog,
                                QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
@@ -16,25 +17,32 @@ import numpy as np
 
 import calibration
 import calibration_io
+import file_io
 import plotting
 import serial_io
+# Re exported: these used to live here, and other modules import them from here.
+from ui import (UnitBanner, captioned, collapsible_group, help_button,  # noqa: F401
+                set_role, tip, wrapped_label)
+
+log = logging.getLogger('osprad.calibration_wizard')
 
 PIXELS = calibration.PIXELS
-SAT_VALUE = 1000  # firmware's over-exposure threshold, used to normalise linCoefs
+SAT_VALUE = 1000  # firmware's over exposure threshold, used to normalise linCoefs
 
 # Servo/wheel mechanism stalls outside this range on the reference unit; see serial_io.
 WHEEL_MIN_ANGLE = 15
 WHEEL_MAX_ANGLE = 165
 
 WHEEL_ROLE_HELP = {
-    'D': "Blocks all light (closed shutter). Used to measure the sensor's own dark-current "
-         "baseline, which the firmware subtracts from every Radiance/Irradiance reading.",
-    'I': "Positions the cosine-corrected diffuser over the sensor. Measures light from the "
-         "whole sky/hemisphere above a surface - ambient light. This is what the main "
-         "window's 'Irradiance' button measures.",
-    'R': "Positions the clear aperture - a narrow, aimable field of view. Measures light "
-         "from a specific point or surface, like a spot brightness meter. This is what "
-         "the main window's 'Radiance' button measures.",
+    'D': "Blocks all light (closed shutter). Used to measure the sensor's own dark "
+         "current baseline, which the firmware subtracts from every Radiance/"
+         "Irradiance reading.",
+    'I': "Positions the cosine corrected diffuser over the sensor. Measures light "
+         "from the whole sky/hemisphere above a surface (ambient light). This is "
+         "what the main window's 'Irradiance' button measures.",
+    'R': "Positions the clear aperture (a narrow, aimable field of view). Measures "
+         "light from a specific point or surface, like a spot brightness meter. "
+         "This is what the main window's 'Radiance' button measures.",
 }
 
 WHEEL_ROLE_NAMES = {'D': 'Dark', 'I': 'Irradiance', 'R': 'Radiance'}
@@ -44,38 +52,8 @@ class CalibrationFitError(Exception):
     pass
 
 
-def wrapped_label(text):
-    label = QLabel(text)
-    label.setWordWrap(True)
-    return label
-
-
-def tip(widget, text):
-    """Set a tooltip with a wrap length approximating the old Tkinter Tooltip (280px)."""
-    widget.setToolTip('<div style="max-width:280px">%s</div>' % text)
-
-
-def collapsible_group(title, start_open=False):
-    """A QGroupBox whose contents fold away (Qt's checkable QGroupBox only greys out).
-
-    Returns (group, content_layout). The point is to reclaim vertical space that
-    checkable QGroupBox still costs, which matters on a phone screen.
-    """
-    group = QGroupBox(title)
-    group.setCheckable(True)
-    group.setChecked(start_open)
-    outer = QVBoxLayout(group)
-    outer.setContentsMargins(0, 0, 0, 0)
-    body = QWidget()
-    body.setVisible(start_open)
-    outer.addWidget(body)
-    group.toggled.connect(body.setVisible)
-    return group, QVBoxLayout(body)
-
-
-def _read_number_file(path):
-    with open(path) as handle:
-        text = handle.read()
+def _parse_numbers(text):
+    """Pull every number out of a delimited text file, ignoring anything unparseable."""
     for sep in (',', ';', '\t', '\n'):
         text = text.replace(sep, ' ')
     values = []
@@ -88,8 +66,8 @@ def _read_number_file(path):
 
 
 def golden_section_minimize(objective, lo, hi, tol=1e-10, max_iter=500):
-    """Bounded scalar minimizer for LinearisationTab._fit()'s single-parameter fit,
-    hand-rolled in place of scipy.optimize.least_squares (scipy has no Android build).
+    """Bounded scalar minimizer for LinearisationTab._fit()'s single parameter fit,
+    hand rolled in place of scipy.optimize.least_squares (scipy has no Android build).
     """
     invphi = (math.sqrt(5) - 1) / 2
     a, b = lo, hi
@@ -124,11 +102,12 @@ def gaussian_smooth(values, sigma):
 
 
 class UnitSetupTab(QWidget):
-    """Set the three shutter-wheel positions, saved to the Arduino's EEPROM."""
+    """Set the three shutter wheel positions, saved to the Arduino's EEPROM."""
 
-    def __init__(self, connection):
+    def __init__(self, connection, store=None):
         super().__init__()
         self.connection = connection
+        self.store = store
         self._connected_widgets = []
         self._last_sent_angle = None
         self._saved_angles = {'D': None, 'I': None, 'R': None}
@@ -138,10 +117,12 @@ class UnitSetupTab(QWidget):
         self._jog_timer.timeout.connect(self._jog_now)
 
         layout = QVBoxLayout(self)
+        self.unit_banner = UnitBanner()
+        layout.addWidget(self.unit_banner)
         layout.addWidget(wrapped_label(
-            'Set this unit\'s shutter-wheel positions. Stored on the Arduino, so this '
-            'only needs doing once per unit - no reflashing. (Unit number lives on the '
-            'Import & export tab.)'))
+            'Set this unit\'s shutter wheel positions. Stored on the Arduino, so '
+            'this only needs doing once per unit (no reflashing). The unit number '
+            'lives on the Import & export tab.'))
 
         self.config_label = wrapped_label('')
         layout.addWidget(self.config_label)
@@ -149,8 +130,9 @@ class UnitSetupTab(QWidget):
         wheel_group = QGroupBox('Shutter wheel')
         wheel_layout = QVBoxLayout(wheel_group)
         wheel_layout.addWidget(wrapped_label(
-            'Move the wheel with the slider, then save each position once it lines up. '
-            'Dark = closed (centre); irradiance = cosine diffuser; radiance = clear aperture.'))
+            'Move the wheel with the slider, then save each position once it lines '
+            'up. Dark = closed (centre); irradiance = cosine diffuser; radiance = '
+            'clear aperture.'))
 
         slider_row = QHBoxLayout()
         minus_btn = QPushButton('-')
@@ -188,7 +170,8 @@ class UnitSetupTab(QWidget):
         positions_layout = QGridLayout()
         for i, role in enumerate(('D', 'I', 'R')):
             role_name = WHEEL_ROLE_NAMES[role]
-            positions_layout.addWidget(QLabel(role_name + ':'), i, 0)
+            positions_layout.addWidget(
+                captioned(QLabel(role_name + ':'), WHEEL_ROLE_HELP[role]), i, 0)
             value_label = QLabel('-')
             positions_layout.addWidget(value_label, i, 1)
             self._role_value_labels[role] = value_label
@@ -196,7 +179,7 @@ class UnitSetupTab(QWidget):
             go_role_btn = QPushButton('Go')
             go_role_btn.setFixedWidth(48)
             go_role_btn.clicked.connect(lambda checked=False, r=role: self._go_to_position(r))
-            go_role_btn.setToolTip('Move the wheel to the saved %s position.' % role_name)
+            tip(go_role_btn, 'Move the wheel to the saved %s position.' % role_name)
             positions_layout.addWidget(go_role_btn, i, 2)
             self._connected_widgets.append(go_role_btn)
 
@@ -214,29 +197,36 @@ class UnitSetupTab(QWidget):
 
         self.set_connection(connection)
 
-    def set_connection(self, connection):
+    def set_connection(self, connection, config=None):
         self.connection = connection
+        if connection is not None and config is not None:
+            self.unit_banner.set_config(config, getattr(self, 'store', None))
+        else:
+            self.unit_banner.set_disconnected()
         # Physical wheel may have moved between sessions or the unit been reflashed.
         self._last_sent_angle = None
         for w in self._connected_widgets:
             w.setEnabled(connection is not None)
         if connection:
-            self._refresh()
+            self._refresh(config)
         else:
             self.config_label.setText('Not connected.')
             self.status.setText('')
             for label in self._role_value_labels.values():
                 label.setText('-')
 
-    def _refresh(self):
-        try:
-            config = self.connection.get_config()
-        except serial_io.SpecError as exc:
-            self.config_label.setText(str(exc))
-            return
+    def _refresh(self, config=None):
+        # The connect worker already fetched this; re asking is a second blocking
+        # round trip for a number we have.
+        if config is None:
+            try:
+                config = self.connection.get_config()
+            except serial_io.SpecError as exc:
+                self.config_label.setText(str(exc))
+                return
         state = 'configured' if config.configured else 'not yet configured (firmware defaults)'
         self.config_label.setText(
-            'Unit #%d - Firmware v%s, %s' % (config.unit_number, config.firmware, state))
+            'Unit #%d, firmware v%s, %s' % (config.unit_number, config.firmware, state))
 
         self._saved_angles = {'D': config.dark, 'I': config.irr, 'R': config.rad}
         for role, label in self._role_value_labels.items():
@@ -252,8 +242,8 @@ class UnitSetupTab(QWidget):
         self._jog_now()
 
     def _on_slider_changed(self, value):
-        # Sync the free-typed entry with the slider (they shared one Tkinter var in
-        # the old UI; here they're synced by hand).
+        # Sync the free typed entry with the slider (they shared one Tkinter var
+        # in the old UI; here they're synced by hand).
         self.angle_edit.blockSignals(True)
         self.angle_edit.setText(str(value))
         self.angle_edit.blockSignals(False)
@@ -296,7 +286,7 @@ class UnitSetupTab(QWidget):
         angle = self._saved_angles.get(role)
         role_name = WHEEL_ROLE_NAMES[role]
         if angle is None or angle < WHEEL_MIN_ANGLE or angle > WHEEL_MAX_ANGLE:
-            self.status.setText('%s position has not been saved yet - move the wheel '
+            self.status.setText('%s position has not been saved yet; move the wheel '
                                 'and click "Set as %s" first.' % (role_name, role_name))
             return
         self.angle_slider.setValue(angle)
@@ -314,13 +304,24 @@ class LinearisationTab(QWidget):
         self.result = None
 
         layout = QVBoxLayout(self)
+        self.unit_banner = UnitBanner()
+        layout.addWidget(self.unit_banner)
         layout.addWidget(wrapped_label(
-            'Point the OSpRad at a steady, non-flickering source (daylight or an '
+            'Point the OSpRad at a steady, non flickering source (daylight or an '
             'incandescent lamp; avoid most LED/fluorescent lighting) and keep both '
-            'still. The wizard measures across a range of integration times and fits '
-            'the curve so doubling exposure doubles the reported signal.'))
+            'still. The wizard measures across a range of integration times and '
+            'fits the curve so doubling exposure doubles the reported signal.'))
 
         controls = QHBoxLayout()
+        mode_label = QLabel('Measure:')
+        mode_tip = ('Which quantity the sweep measures. Pick one, then press Run '
+                    'measurements.\n\n'
+                    'Radiance uses the clear aperture (a narrow, aimable view); '
+                    'irradiance uses the cosine diffuser. Linearity is a property of '
+                    'the sensor, so either works. Use whichever suits the steady '
+                    'source you have set up.')
+        tip(mode_label, mode_tip)
+        controls.addWidget(captioned(mode_label, mode_tip))
         self.radio_r = QRadioButton('Radiance')
         self.radio_r.setChecked(True)
         self.radio_i = QRadioButton('Irradiance')
@@ -350,8 +351,15 @@ class LinearisationTab(QWidget):
     def _mode(self):
         return 'r' if self.radio_r.isChecked() else 'i'
 
-    def set_connection(self, connection):
+    def apply_theme(self, dark):
+        self.plot.apply_theme(dark)
+
+    def set_connection(self, connection, config=None):
         self.connection = connection
+        if connection is not None and config is not None:
+            self.unit_banner.set_config(config, getattr(self, 'store', None))
+        else:
+            self.unit_banner.set_disconnected()
         self.run_button.setEnabled(connection is not None)
         if not connection:
             self.status.setText('Not connected.')
@@ -368,8 +376,9 @@ class LinearisationTab(QWidget):
             self.run_button.setEnabled(True)
 
         if len(samples) < 3:
-            self.status.setText('Not enough usable measurements - try a brighter or '
-                                'dimmer source so the sensor is neither dark nor saturated.')
+            self.status.setText('Not enough usable measurements; try a brighter or '
+                                'dimmer source so the sensor is neither dark nor '
+                                'saturated.')
             return
 
         unit_number = samples[0][2]
@@ -380,7 +389,7 @@ class LinearisationTab(QWidget):
             return
         self.result = (unit_number, coefs)
         self.status.setText('Unit #%d: fitted a = %.5f, b = %.5f from %d integration '
-                            'times. A good fit gives near-horizontal lines below.'
+                            'times. A good fit gives near horizontal lines below.'
                             % (unit_number, coefs[0], coefs[1], len(samples)))
         self._show(samples, coefs)
         self.save_button.setEnabled(True)
@@ -388,7 +397,7 @@ class LinearisationTab(QWidget):
     def _collect(self):
         mode = self._mode()
 
-        # Let the unit pick a well-exposed time, then sweep around it so the ladder
+        # Let the unit pick a well exposed time, then sweep around it so the ladder
         # suits the source in front of the sensor rather than assuming one.
         self.status.setText('Finding a good exposure...')
         QApplication.processEvents()
@@ -402,12 +411,13 @@ class LinearisationTab(QWidget):
         for index, int_time in enumerate(int_times, 1):
             self.status.setText('Measuring %d of %d at %d ms...'
                                 % (index, len(int_times), int_time))
+            log.debug('Linearisation sweep %d/%d at %dms', index, len(int_times), int_time)
             QApplication.processEvents()
             self.connection.set_integration_time(int_time)
             measurement = self.connection.measure(mode)
             counts = np.asarray(measurement.raw_counts)
             if measurement.saturated > 2 or counts.max() < 20:
-                continue  # over-exposed or too dark to be useful
+                continue  # over exposed or too dark to be useful
             samples.append((int_time, counts, measurement.unit_number))
 
         self.connection.set_integration_time(0)
@@ -416,7 +426,8 @@ class LinearisationTab(QWidget):
 
     @staticmethod
     def _usable_mask(counts):
-        """Per-reading mask of well-exposed photosites, keeping pixels seen at 2+ exposures."""
+        """Per reading mask of well exposed photosites, keeping pixels seen at 2+
+        exposures."""
         for threshold in (30, 10, 3):
             mask = (counts > threshold) & (counts < SAT_VALUE)
             mask &= (mask.sum(axis=0) >= 2)
@@ -434,9 +445,9 @@ class LinearisationTab(QWidget):
         mask = cls._usable_mask(counts)
         if mask.sum() < 10:
             raise CalibrationFitError(
-                'Not enough well-exposed photosites across the integration-time sweep. '
-                'Try a source that is brighter, steadier, or more evenly spread across '
-                'the spectrum.')
+                'Not enough well exposed photosites across the integration time '
+                'sweep. Try a source that is brighter, steadier, or more evenly '
+                'spread across the spectrum.')
 
         weights = mask.astype(float)
         per_pixel = weights.sum(axis=0)
@@ -470,7 +481,7 @@ class LinearisationTab(QWidget):
         self.plot._style_axes()
         ax.set_xlabel('Integration time (ms)')
         ax.set_ylabel('Signal per ms (normalised)')
-        ax.set_title('Linearisation check - flat is good', fontsize=10)
+        ax.set_title('Linearisation check; flat is good', fontsize=10)
 
         # Plot only photosites well exposed at every step, so each line spans the sweep.
         raw_rate = counts[:, usable] / times[:, None]
@@ -480,7 +491,7 @@ class LinearisationTab(QWidget):
 
         step = max(1, raw_rate.shape[1] // 40)
         for series, color, label in ((raw_rate, '#d1495b', 'raw counts'),
-                                     (lin_rate, '#2e86ab', 'linearised')):
+                                      (lin_rate, '#2e86ab', 'linearised')):
             normalised = series / series.mean(axis=0)
             for column in range(0, series.shape[1], step):
                 ax.plot(times, normalised[:, column], color=color, alpha=0.35, linewidth=0.9)
@@ -495,27 +506,28 @@ class LinearisationTab(QWidget):
             calib = self.store.get(unit_number)
         except calibration.CalibrationError:
             QMessageBox.critical(self, 'OSpRad', (
-                'Unit #%d has no calibration data yet. Add its wavelength coefficients and '
-                'sensitivity curves first, then save the linearisation.' % unit_number))
+                'Unit #%d has no calibration data yet. Add its wavelength '
+                'coefficients and sensitivity curves first, then save the '
+                'linearisation.' % unit_number))
             return
 
         reply = QMessageBox.question(self, 'OSpRad', (
             'Replace the linearisation coefficients for unit #%d?\n\n'
             'Old: a = %.5f, b = %.5f\nNew: a = %.5f, b = %.5f\n\n'
-            'Measurements are scaled by these coefficients, so afterwards you should '
-            're-derive the spectral sensitivity, or rescale it against a known reading '
-            'on the Spectral sensitivity tab.'
+            'Measurements are scaled by these coefficients, so afterwards you '
+            'should re derive the spectral sensitivity, or rescale it against a '
+            'known reading on the Spectral sensitivity tab.'
             % (unit_number, calib.lin_coefs[0], calib.lin_coefs[1], coefs[0], coefs[1])),
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
         if reply != QMessageBox.StandardButton.Ok:
             return
 
-        # linCoefs set the overall scale of the linearised signal - the sensitivity
+        # linCoefs set the overall scale of the linearised signal. The sensitivity
         # curves are only valid for the coefficients they were derived against.
         calib.lin_coefs = coefs
         self.store.save_unit(calib)
-        self.status.setText('Saved linearisation coefficients for unit #%d. Re-check the '
-                            'spectral sensitivity next.' % unit_number)
+        self.status.setText('Saved linearisation coefficients for unit #%d. Re check '
+                            'the spectral sensitivity next.' % unit_number)
 
 
 class SensitivityTab(QWidget):
@@ -528,6 +540,8 @@ class SensitivityTab(QWidget):
         self.pending = None
 
         layout = QVBoxLayout(self)
+        self.unit_banner = UnitBanner()
+        layout.addWidget(self.unit_banner)
 
         head = QHBoxLayout()
         head.addWidget(QLabel('Calibrating:'))
@@ -542,16 +556,16 @@ class SensitivityTab(QWidget):
         head.addStretch(1)
         layout.addLayout(head)
 
-        # Three routes, ordered easiest-to-hardest: a file you already have; one
-        # reference reading; a full reference spectrum.
+        # Three routes, ordered easiest to hardest: a file you already have, one
+        # reference reading, a full reference spectrum.
         layout.addWidget(wrapped_label(
-            'Three ways to set the curve - pick whichever matches what you have. Each '
-            'previews the result below; nothing is written until you press Save.'))
+            'Three ways to set the curve. Pick whichever matches what you have. '
+            'Each previews the result below; nothing is written until you press Save.'))
 
         importer = QGroupBox('1. Load a curve from a file')
         importer_layout = QVBoxLayout(importer)
         importer_layout.addWidget(wrapped_label(
-            'If you already have %d sensitivity values - for example exported from the '
+            'If you already have %d sensitivity values, for example exported from the '
             '"sensitivity FINAL" sheet of calibration_calculations.ods.'
             % PIXELS))
         self.import_button = QPushButton('Choose file...')
@@ -582,9 +596,9 @@ class SensitivityTab(QWidget):
             '3. Derive from a reference spectrum (advanced)')
         derive_layout.addWidget(wrapped_label(
             'Requires a reference spectroradiometer. Provide the true spectrum of a '
-            'light source as a two-column file (wavelength in nm, then W/(sr*sqm*nm) for '
-            'radiance or W/(sqm*nm) for irradiance). The OSpRad measures the same source '
-            'and the ratio gives its spectral sensitivity.'))
+            'light source as a two column file (wavelength in nm, then W/(sr*sqm*nm) '
+            'for radiance or W/(sqm*nm) for irradiance). The OSpRad measures the same '
+            'source and the ratio gives its spectral sensitivity.'))
         derive_row = QHBoxLayout()
         derive_row.addWidget(QLabel('Smoothing sigma'))
         self.sigma_edit = QLineEdit('2')
@@ -614,8 +628,15 @@ class SensitivityTab(QWidget):
     def _mode(self):
         return 'r' if self.radio_r.isChecked() else 'i'
 
-    def set_connection(self, connection):
+    def apply_theme(self, dark):
+        self.plot.apply_theme(dark)
+
+    def set_connection(self, connection, config=None):
         self.connection = connection
+        if connection is not None and config is not None:
+            self.unit_banner.set_config(config, getattr(self, 'store', None))
+        else:
+            self.unit_banner.set_disconnected()
         enabled = connection is not None
         for w in (self.import_button, self.rescale_button, self.derive_button):
             w.setEnabled(enabled)
@@ -627,13 +648,13 @@ class SensitivityTab(QWidget):
         return self.store.get(config.unit_number)
 
     def _check_exposure(self, measurement):
-        """Reject over-exposed measurements - saturated photosites read low and would
+        """Reject over exposed measurements. Saturated photosites read low and would
         silently corrupt a calibration. Returns False after setting self.status."""
         if measurement.saturated > 0:
             self.status.setText(
-                'Measurement is over-exposed (%g saturated photosites), so it cannot be '
-                'used for calibration. Dim the source, or set a shorter integration time '
-                'on the main window.' % measurement.saturated)
+                'Measurement is over exposed (%g saturated photosites), so it cannot '
+                'be used for calibration. Dim the source, or set a shorter '
+                'integration time on the main window.' % measurement.saturated)
             return False
         return True
 
@@ -642,7 +663,7 @@ class SensitivityTab(QWidget):
             self, 'OSpRad', '', 'Data files (*.csv *.txt *.tsv);;All files (*)')
         if not path:
             return
-        values = _read_number_file(path)
+        values = _parse_numbers(file_io.read_text(path))
         if len(values) != PIXELS:
             QMessageBox.critical(self, 'OSpRad', 'Expected %d values but the file has %d.'
                                  % (PIXELS, len(values)))
@@ -678,12 +699,12 @@ class SensitivityTab(QWidget):
         flux = calib.to_flux(measurement.raw_counts, mode, measurement.int_time)
         measured = calib.luminance(flux)
         if measured <= 0:
-            self.status.setText('Measured signal is zero - check the shutter positions.')
+            self.status.setText('Measured signal is zero; check the shutter positions.')
             return
 
         factor = measured / reference
         values = [v * factor for v in calib.sensitivity(mode)]
-        self._stage(calib, values, 'Measured %.4g, reference %.4g - sensitivity scaled by %.4f.'
+        self._stage(calib, values, 'Measured %.4g, reference %.4g; sensitivity scaled by %.4f.'
                     % (measured, reference, factor))
 
     def _derive(self):
@@ -692,7 +713,7 @@ class SensitivityTab(QWidget):
             'Data files (*.csv *.txt *.tsv);;All files (*)')
         if not path:
             return
-        numbers = _read_number_file(path)
+        numbers = _parse_numbers(file_io.read_text(path))
         if len(numbers) < 4 or len(numbers) % 2:
             QMessageBox.critical(self, 'OSpRad', 'Expected two columns: wavelength and flux.')
             return
@@ -743,7 +764,7 @@ class SensitivityTab(QWidget):
         self.save_button.setEnabled(True)
         calib._derive()
         self.plot.update(calib.wavelength, values, None,
-                         '%s sensitivity - unit #%d'
+                         '%s sensitivity, unit #%d'
                          % ('Irradiance' if self._mode() == 'i' else 'Radiance',
                             calib.unit_number))
 
@@ -760,13 +781,28 @@ class SensitivityTab(QWidget):
 
 
 class _AngleDiagram(QWidget):
-    """Top-down schematic: sensor at centre, dashed 0-degree reference, solid line +
-    light-source icon at the requested angle. Easier to eyeball than the number alone."""
+    """Top down schematic: sensor at centre, dashed 0 degree reference, solid line +
+    light source icon at the requested angle. Easier to eyeball than the number alone."""
+
+    # Room kept clear above the sensor dot for the "light" caption, and below it for
+    # the "sensor" caption plus the bold angle readout. Geometry is derived from
+    # these rather than hardcoded, so the captions cannot be drawn outside the
+    # widget again.
+    _TOP_RESERVE = 30
+    _BOTTOM_RESERVE = 44
 
     def __init__(self):
         super().__init__()
-        self.setFixedSize(150, 130)
+        self.setMinimumSize(160, 150)
         self.angle = 0.0
+        self._dark = False
+
+    def sizeHint(self):
+        return QSize(160, 150)
+
+    def apply_theme(self, dark):
+        self._dark = dark
+        self.update()
 
     def set_angle(self, angle):
         self.angle = angle
@@ -775,10 +811,12 @@ class _AngleDiagram(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        cx, cy, radius = 75, 100, 65
+        cx = self.width() / 2.0
+        cy = self.height() - self._BOTTOM_RESERVE
+        radius = max(20.0, min(cx - 12, cy - self._TOP_RESERVE))
 
         painter.setPen(QPen(QColor('#999999'), 1, Qt.PenStyle.DashLine))
-        painter.drawLine(cx, cy, cx, cy - radius)
+        painter.drawLine(QPointF(cx, cy), QPointF(cx, cy - radius))
 
         angle = min(max(self.angle, 0), 90)
         rad = math.radians(angle)
@@ -787,7 +825,7 @@ class _AngleDiagram(QWidget):
 
         if angle > 0.5:
             # Qt angles are in 1/16ths of a degree, positive = counterclockwise from
-            # 3 o'clock - opposite of Tk's create_arc, so this sweeps from 12 o'clock
+            # 3 o'clock, opposite of Tk's create_arc, so this sweeps from 12 o'clock
             # (90*16) clockwise (negative span) by `angle`.
             painter.setPen(QPen(QColor('#2a9d8f'), 2))
             painter.drawArc(QRectF(cx - 24, cy - 24, 48, 48), 90 * 16, -int(round(angle * 16)))
@@ -798,31 +836,35 @@ class _AngleDiagram(QWidget):
         painter.setBrush(QColor('#e9a23a'))
         painter.drawEllipse(QPointF(ex, ey), 6, 6)
         painter.setPen(QColor('#e9a23a'))
-        painter.drawText(QRectF(ex - 30, ey - 28, 60, 16), Qt.AlignmentFlag.AlignCenter, 'light')
+        # Clamped into the widget: at 90 degrees the marker sits hard against the
+        # right edge and an uncentred rect would run the caption off it.
+        light_x = min(max(ex - 30, 0.0), self.width() - 60.0)
+        painter.drawText(QRectF(light_x, ey - 28, 60, 16),
+                         Qt.AlignmentFlag.AlignCenter, 'light')
 
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(QColor('#2e86ab'))
         painter.drawEllipse(QPointF(cx, cy), 7, 7)
-        painter.setPen(QColor('#7a7a7a'))
-        painter.drawText(QRectF(cx - 30, cy + 8, 60, 16), Qt.AlignmentFlag.AlignCenter, 'sensor')
+        painter.setPen(QColor('#9a9a9a' if self._dark else '#7a7a7a'))
+        painter.drawText(QRectF(cx - 30, cy + 6, 60, 14), Qt.AlignmentFlag.AlignCenter, 'sensor')
         font = painter.font()
         font.setBold(True)
         painter.setFont(font)
-        painter.setPen(QColor('#1c1c1c'))
-        painter.drawText(QRectF(cx - 30, cy + 22, 60, 16), Qt.AlignmentFlag.AlignCenter,
+        painter.setPen(QColor('#fafafa' if self._dark else '#1c1c1c'))
+        painter.drawText(QRectF(cx - 30, cy + 22, 60, 18), Qt.AlignmentFlag.AlignCenter,
                          '%.0f\N{DEGREE SIGN}' % angle)
 
 
 class CosineResponseTab(QWidget):
-    """Checks the cosine diffuser's angular response (not its colour - that's the
+    """Checks the cosine diffuser's angular response (not its colour; that's the
     Monitor calibration tab's job). Measures Irradiance at a series of incidence
     angles against a fixed, distant source, then plots the response normalised to
-    the 0-degree reading against the ideal cos(angle) falloff."""
+    the 0 degree reading against the ideal cos(angle) falloff."""
 
-    # Common, easy-to-eyeball angles with a plain-language sense of "off straight-on".
+    # Common, easy to eyeball angles with a plain language sense of "off straight on".
     PRESET_ANGLES = ((0, 'Straight on'), (15, 'Slight angle'), (30, 'A third turn'),
-                     (45, 'Diagonal'), (60, 'Steep angle'), (75, 'Nearly edge-on'),
-                     (90, 'Edge-on'))
+                     (45, 'Diagonal'), (60, 'Steep angle'), (75, 'Nearly edge on'),
+                     (90, 'Edge on'))
 
     def __init__(self, connection, store):
         super().__init__()
@@ -831,16 +873,18 @@ class CosineResponseTab(QWidget):
         self.results = []  # [(angle_deg, lux), ...]
 
         layout = QVBoxLayout(self)
+        self.unit_banner = UnitBanner()
+        layout.addWidget(self.unit_banner)
         layout.addWidget(wrapped_label(
-            'Point the sensor at a small, distant, steady source (direct sunlight is '
-            'ideal; indoors a bare bulb several metres away works) and keep source and '
-            'distance fixed throughout. No protractor needed: a fist at arm\'s length '
-            'spans ~10 degrees, so 3 fists = ~30, 4-5 = ~45, 6 = ~60.'))
+            'Point the sensor at a small, distant, steady source (direct sunlight '
+            'is ideal; indoors a bare bulb several metres away works) and keep '
+            'source and distance fixed throughout. No protractor needed: a fist at '
+            'arm\'s length spans ~10 degrees, so 3 fists = ~30, 4 or 5 = ~45, 6 = ~60.'))
         layout.addWidget(wrapped_label(
-            'Start with "Straight on" - that reading is the reference every other angle '
-            'is compared against. A well-behaved cosine diffuser reads close to '
-            'cos(angle) of the reference: 87% at 30 deg, 71% at 45, 50% at 60. '
-            'Consistent under-response at high angles is the classic failure mode '
+            'Start with "Straight on"; that reading is the reference every other '
+            'angle is compared against. A well behaved cosine diffuser reads close '
+            'to cos(angle) of the reference: 87% at 30 deg, 71% at 45, 50% at 60. '
+            'Consistent under response at high angles is the classic failure mode '
             '(tape too thick, or shadowed by the housing).'))
 
         picker = QHBoxLayout()
@@ -862,8 +906,9 @@ class CosineResponseTab(QWidget):
         entry_row.addWidget(QLabel('Angle (degrees)'))
         self.angle_edit = QLineEdit('0')
         self.angle_edit.setFixedWidth(60)
-        self.angle_edit.setToolTip('Type an exact angle instead of using a preset, if '
-                                   'you have a protractor or jig for precise positioning.')
+        self.angle_edit.setToolTip('Type an exact angle instead of using a preset, '
+                                   'if you have a protractor or jig for precise '
+                                   'positioning.')
         self.angle_edit.textChanged.connect(self._on_angle_typed)
         entry_row.addWidget(self.angle_edit)
         self.measure_button = QPushButton('Measure')
@@ -898,7 +943,7 @@ class CosineResponseTab(QWidget):
         if angle == 0:
             self.status.setText('Point the sensor straight at the source, then press Measure.')
         else:
-            self.status.setText('Point the sensor about %d\N{DEGREE SIGN} off straight-on '
+            self.status.setText('Point the sensor about %d\N{DEGREE SIGN} off straight on '
                                 '(see the diagram), then press Measure.' % angle)
 
     def _on_angle_typed(self, text):
@@ -908,8 +953,16 @@ class CosineResponseTab(QWidget):
             return
         self.diagram.set_angle(angle)
 
-    def set_connection(self, connection):
+    def apply_theme(self, dark):
+        self.plot.apply_theme(dark)
+        self.diagram.apply_theme(dark)
+
+    def set_connection(self, connection, config=None):
         self.connection = connection
+        if connection is not None and config is not None:
+            self.unit_banner.set_config(config, getattr(self, 'store', None))
+        else:
+            self.unit_banner.set_disconnected()
         for w in self._connected_widgets:
             w.setEnabled(connection is not None)
         if not connection:
@@ -939,8 +992,8 @@ class CosineResponseTab(QWidget):
             self.status.setText('Measured %.1f lux at %.1f degrees.' % (lux, angle))
         else:
             self.status.setText(
-                'Measured %.1f lux at %.1f degrees. Measure at 0 degrees (facing the '
-                'source directly) too, to use as the reference.' % (lux, angle))
+                'Measured %.1f lux at %.1f degrees. Measure at 0 degrees (facing '
+                'the source directly) too, to use as the reference.' % (lux, angle))
         self._refresh()
 
     def _clear(self):
@@ -972,7 +1025,7 @@ class CosineResponseTab(QWidget):
         self.plot._style_axes()
         ax.set_xlabel('Angle from source (degrees)')
         ax.set_ylabel('Normalised response')
-        ax.set_title('Cosine response - closer to the dashed line is better', fontsize=10)
+        ax.set_title('Cosine response; closer to the dashed line is better', fontsize=10)
 
         angles_ideal = np.linspace(0, 90, 91)
         ax.plot(angles_ideal, np.cos(np.radians(angles_ideal)), color=self.plot.colors['grid'],
@@ -993,10 +1046,10 @@ class CosineResponseTab(QWidget):
 class CalibrationTransferTab(QWidget):
     """Unit number, plus export/import of everything else as one JSON file.
 
-    Calibrated transfer lives here (not on the tab that produces each value) so there
-    is one obvious place to back a unit up from and restore it to. The unit number
-    sits here too: it's what ties the two halves together - CSV rows are looked up by
-    it, and it's stored on the Arduino alongside the wheel positions.
+    Calibrated transfer lives here (not on the tab that produces each value) so
+    there is one obvious place to back a unit up from and restore it to. The unit
+    number sits here too: it's what ties the two halves together. CSV rows are
+    looked up by it, and it's stored on the Arduino alongside the wheel positions.
     """
 
     def __init__(self, connection, store, log=None):
@@ -1006,11 +1059,14 @@ class CalibrationTransferTab(QWidget):
         self._log = log or (lambda text, level='info': None)
 
         layout = QVBoxLayout(self)
+        self.unit_banner = UnitBanner()
+        layout.addWidget(self.unit_banner)
 
         unit_group = QGroupBox('Unit number')
         unit_layout = QVBoxLayout(unit_group)
         unit_layout.addWidget(wrapped_label(
-            'Each unit needs its own ID, used to look up its calibration data. Stored on the Arduino.'))
+            'Each unit needs its own ID, used to look up its calibration data. '
+            'Stored on the Arduino.'))
         unit_row = QHBoxLayout()
         self.unit_number_edit = QLineEdit()
         self.unit_number_edit.setFixedWidth(80)
@@ -1034,7 +1090,7 @@ class CalibrationTransferTab(QWidget):
             self.field_checks[key] = check
             select_layout.addWidget(check)
         tip(self.field_checks[calibration_io.WHEEL_FIELD],
-            'Read from (and written to) the Arduino, not calibration_data.csv - this '
+            'Read from (and written to) the Arduino, not calibration_data.csv. This '
             'one needs a connected unit.')
         layout.addWidget(select_group)
 
@@ -1054,22 +1110,27 @@ class CalibrationTransferTab(QWidget):
 
         self.set_connection(connection)
 
-    def set_connection(self, connection):
+    def set_connection(self, connection, config=None):
         self.connection = connection
+        if connection is not None and config is not None:
+            self.unit_banner.set_config(config, getattr(self, 'store', None))
+        else:
+            self.unit_banner.set_disconnected()
         self.save_unit_button.setEnabled(connection is not None)
         self.unit_number_edit.setEnabled(connection is not None)
         if connection is None:
             self.unit_number_edit.clear()
             self.status.setText(
-                'Not connected - exports cover calibration_data.csv only; the unit number '
-                'and wheel positions can\'t be read or written.')
+                'Not connected; exports cover calibration_data.csv only. The unit '
+                'number and wheel positions can\'t be read or written.')
             return
         self.status.setText('')
-        try:
-            config = connection.get_config()
-        except serial_io.SpecError as exc:
-            self.status.setText(str(exc))
-            return
+        if config is None:
+            try:
+                config = connection.get_config()
+            except serial_io.SpecError as exc:
+                self.status.setText(str(exc))
+                return
         self.unit_number_edit.setText(str(config.unit_number))
 
     def _selected_fields(self):
@@ -1089,7 +1150,7 @@ class CalibrationTransferTab(QWidget):
     def _export(self):
         fields = self._selected_fields()
         if not fields:
-            self.status.setText('Nothing selected to export - tick at least one item above.')
+            self.status.setText('Nothing selected to export; tick at least one item above.')
             return
 
         config = None
@@ -1117,17 +1178,17 @@ class CalibrationTransferTab(QWidget):
                 self.status.setText(str(exc))
                 return
         if calib is None:
-            # Wheel positions only - build_export still needs a CalibrationSet to read
-            # the unit number off, but doesn't touch the (unused) curves.
+            # Wheel positions only. build_export still needs a CalibrationSet to
+            # read the unit number off, but doesn't touch the (unused) curves.
             calib = calibration.CalibrationSet(unit_number, [], [], [], [])
 
-        path, _ = QFileDialog.getSaveFileName(
-            self, 'Export calibration', 'osprad-unit%d-calibration.json' % unit_number,
-            'OSpRad calibration (*.json)')
+        path, _ = file_io.ask_save_path(
+            self, 'osprad-unit%d-calibration.json' % unit_number,
+            'OSpRad calibration (*.json)', title='Export calibration')
         if not path:
             return
         try:
-            calibration_io.write_file(path, calib, config, fields)
+            file_io.write_text(path, calibration_io.dumps(calib, config, fields))
         except OSError as exc:
             self.status.setText('Could not write %s: %s' % (path, exc))
             return
@@ -1138,7 +1199,7 @@ class CalibrationTransferTab(QWidget):
         skipped = (calibration_io.WHEEL_FIELD in fields and config is None)
         message = 'Exported unit #%d: %s.' % (unit_number, ', '.join(written).lower())
         if skipped:
-            message += (' Wheel positions were skipped - they can only be read from a '
+            message += (' Wheel positions were skipped; they can only be read from a '
                         'connected unit.')
         self.status.setText(message)
         self._log('Exported unit #%d calibration to %s' % (unit_number, path),
@@ -1152,8 +1213,8 @@ class CalibrationTransferTab(QWidget):
         if not path:
             return
         try:
-            imported = calibration_io.read_file(path)
-        except calibration_io.CalibrationIOError as exc:
+            imported = calibration_io.loads(file_io.read_text(path), path)
+        except (calibration_io.CalibrationIOError, OSError) as exc:
             self.status.setText(str(exc))
             QMessageBox.critical(self, 'OSpRad', str(exc))
             return
@@ -1189,11 +1250,11 @@ class CalibrationTransferTab(QWidget):
         if wants_wheel and self.connection is not None:
             message.append('')
             message.append('Writes the wheel positions (dark %(dark)d, irradiance '
-                           '%(irr)d, radiance %(rad)d) to the connected Arduino, moving '
-                           'the wheel to each in turn.' % imported.wheel)
+                           '%(irr)d, radiance %(rad)d) to the connected Arduino, '
+                           'moving the wheel to each in turn.' % imported.wheel)
         elif wants_wheel:
             message.append('')
-            message.append('The wheel positions in this file will be skipped - nothing '
+            message.append('The wheel positions in this file will be skipped; nothing '
                            'is connected to write them to.')
 
         reply = QMessageBox.question(
@@ -1218,8 +1279,8 @@ class CalibrationTransferTab(QWidget):
                 # The CSV half is already saved by this point, so say what landed
                 # rather than implying the whole import failed.
                 self.status.setText(
-                    'Imported %s, but writing the wheel positions to the Arduino failed: %s'
-                    % (', '.join(done).lower(), exc))
+                    'Imported %s, but writing the wheel positions to the Arduino '
+                    'failed: %s' % (', '.join(done).lower(), exc))
                 self._log('Wheel positions failed to import: %s' % exc, level='error')
                 return
             done.append(calibration_io.FIELD_LABELS[calibration_io.WHEEL_FIELD])

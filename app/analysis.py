@@ -2,8 +2,8 @@ import numpy as np
 
 
 def peak_wavelength(wavelength, flux):
-    """Peak wavelength (nm), with 3-point parabolic sub-pixel refinement around the
-    maximum sample (the 288-pixel sensor is coarse enough that this helps)."""
+    """Peak wavelength (nm), with 3 point parabolic sub pixel refinement around the
+    maximum sample. The 288 pixel sensor is coarse enough that this helps."""
     w = np.asarray(wavelength, dtype=float)
     y = np.asarray(flux, dtype=float)
     i = int(np.argmax(y))
@@ -21,9 +21,9 @@ def peak_wavelength(wavelength, flux):
 
 
 def fwhm(wavelength, flux):
-    """Full width at half maximum (nm), via linear interpolation of the half-max
-    crossings nearest the peak. Returns None if neither side drops below half-max
-    inside the recorded window (broadband sources); the UI renders that as "n/a"."""
+    """Full width at half maximum (nm), via linear interpolation of the half max
+    crossings nearest the peak. Returns None if neither side drops below half max
+    inside the recorded window (broadband sources). The UI renders that as n/a."""
     w = np.asarray(wavelength, dtype=float)
     y = np.asarray(flux, dtype=float)
     peak = int(np.argmax(y))

@@ -1,16 +1,16 @@
-# Touch stand-ins for two things a touchscreen has no way to express: hovering (which is
-# how Qt tooltips are normally triggered) and a right button (which is how context menus
-# are). A long press covers both.
+# Touch stand ins for two things a touchscreen has no way to express: hovering
+# (which is how Qt tooltips are normally triggered) and a right button (which is how
+# context menus are). A long press covers both.
 #
-# Everything here is gated on the press having been synthesised from a touch event, so a
-# desktop mouse keeps its ordinary hover-tooltip and right-click behaviour untouched and
-# a touchscreen laptop gets the affordances for free.
+# Everything here is gated on the press having been synthesised from a touch event, so
+# a desktop mouse keeps its ordinary hover tooltip and right click behaviour
+# untouched and a touchscreen laptop gets the affordances for free.
 
 from PySide6.QtCore import QEvent, QObject, Qt, QTimer
 from PySide6.QtWidgets import QToolTip
 
 # Long enough not to fire on a tap, short enough not to feel broken. Matches the usual
-# Android long-press feel (~500ms).
+# Android long press feel (~500ms).
 LONG_PRESS_MS = 500
 
 # A press that wanders further than this is the start of a scroll, not a long press.
@@ -64,17 +64,17 @@ class _LongPress(QObject):
 
 
 def install_long_press(widget, callback):
-    """Call callback(pos) when `widget` is long-pressed. pos is widget-local, matching
+    """Call callback(pos) when `widget` is long pressed. pos is widget local, matching
     what QWidget.customContextMenuRequested would have delivered."""
     return _LongPress(widget, callback)
 
 
 class _TouchTooltips(QObject):
-    """Application-wide: long-press any widget carrying a tooltip to read it.
+    """Application wide: long press any widget carrying a tooltip to read it.
 
-    Deliberately only consults the pressed widget's own tooltip rather than walking up
-    its parents - every tip() in this app is set on the leaf widget, and a walk would
-    surface an ancestor's tooltip for unrelated children.
+    Only consults the pressed widget's own tooltip rather than walking up its parents.
+    Every tip() in this app is set on the leaf widget, and a walk would surface an
+    ancestor's tooltip for unrelated children.
     """
 
     def __init__(self, app):
@@ -119,6 +119,6 @@ class _TouchTooltips(QObject):
 
 
 def enable_touch_tooltips(app):
-    """Install the app-wide long-press-to-see-a-tooltip filter. Keep the return value
+    """Install the app wide long press to see a tooltip filter. Keep the return value
     alive for as long as the app is."""
     return _TouchTooltips(app)

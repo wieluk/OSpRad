@@ -1,4 +1,4 @@
-# Build Windows OSpRad.exe via PyInstaller. Must run on Windows - PyInstaller doesn't cross-compile.
+# Build Windows OSpRad.exe via PyInstaller. Must run on Windows. PyInstaller doesn't cross compile.
 #
 # Usage (PowerShell, from repo root):
 #   pip install -r app\requirements.txt pyinstaller

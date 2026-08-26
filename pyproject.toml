@@ -41,11 +41,13 @@ py-modules = [
     "calibration_io",
     "calibration_wizard",
     "datalog",
+    "file_io",
     "monitor_calibration",
     "plotting",
     "qt_worker",
     "serial_io",
     "touch",
+    "ui",
 ]
 
 [tool.setuptools.dynamic]

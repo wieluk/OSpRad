@@ -9,5 +9,6 @@ pyserial==3.5
 numpy==2.5.2
 PySide6==6.11.2
 
-# scipy is only needed for the Monitor calibration tab's .mat export (no Android build).
-# scipy==1.18.0
+# Only needed for the Monitor calibration tab's .mat export. Safe here because the
+# Android build (which has no scipy wheel) never reads this file.
+scipy==1.18.0

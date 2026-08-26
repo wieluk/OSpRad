@@ -1,38 +1,45 @@
-# Monitor calibration: steps a fullscreen patch through each R/G/B channel at a ladder
-# of levels, measures the spectrum at each step, and exports a plain CSV or a fitted
-# PsychCal .mat.
+# Monitor calibration: steps a fullscreen patch through each R/G/B channel at a
+# ladder of levels, measures the spectrum at each step, and exports a plain CSV or
+# a fitted PsychCal .mat.
 #
-# Psychtoolbox: the .mat loads directly via `cal = LoadCalFile(...)` (no MATLAB-side
-# step, matching CalibrateMonSpd). The linear device model (P_device/T_device/raw
-# gamma weights) ports PTB's CalibrateFitLinMod/FindModelWeights exactly. The tone
-# curve is a monotone PCHIP, NOT a port of PTB's CalibrateFitGamma: that algorithm
-# wasn't confirmable from source, and a partial reimplementation risked a
-# plausible-but-wrong curve. cal.describe.gamma.fitType says 'OSpRad-pchip' so the
-# difference is visible rather than implied away. T_device/T_ambient use OSpRad's own
-# analytic CIE 1931 approximation, close to but not bit-identical with PTB's tables.
+# Psychtoolbox: the .mat loads directly via `cal = LoadCalFile(...)` (no MATLAB
+# side step, matching CalibrateMonSpd). The linear device model
+# (P_device/T_device/raw gamma weights) ports PTB's CalibrateFitLinMod/
+# FindModelWeights exactly. The tone curve is a monotone PCHIP, NOT a port of
+# PTB's CalibrateFitGamma: that algorithm wasn't confirmable from source, and a
+# partial reimplementation risked a plausible but wrong curve.
+# cal.describe.gamma.fitType says 'OSpRad-pchip' so the difference is visible
+# rather than implied away. T_device/T_ambient use OSpRad's own analytic CIE
+# 1931 approximation, close to but not bit identical with PTB's tables.
 
+import io
+import logging
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QFileDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit, QMessageBox,
                                QPushButton, QVBoxLayout, QWidget)
 
 import numpy as np
 
 import calibration
+import file_io
 import plotting
 import serial_io
-from calibration_wizard import WHEEL_MAX_ANGLE, WHEEL_MIN_ANGLE, tip, wrapped_label
+from calibration_wizard import WHEEL_MAX_ANGLE, WHEEL_MIN_ANGLE
+from ui import UnitBanner, help_button, tip, wrapped_label
 from qt_worker import Worker
 
-# Default Psychtoolbox wavelength sampling spec S = [startWL, deltaWL, numWL], matching
-# CalibrateMonSpd's own common default (380:4:780nm, 101 samples).
+# Default Psychtoolbox wavelength sampling spec S = [startWL, deltaWL, numWL],
+# matching CalibrateMonSpd's own common default (380:4:780nm, 101 samples).
 DEFAULT_PTB_S = (380, 4, 101)
+
+log = logging.getLogger('osprad.monitor_calibration')
 
 
 def resample_to_ptb_grid(wavelength, flux, s_spec):
-    """Linearly interpolate the sensor's uneven wavelength axis onto PTB's uniform
-    S = [start, delta, n] grid; edges outside the sensor's range fill with 0."""
+    """Linearly interpolate the sensor's uneven wavelength axis onto PTB's
+    uniform S = [start, delta, n] grid; edges outside the sensor's range fill 0."""
     start, delta, n = s_spec
     grid = start + delta * np.arange(n)
     resampled = np.interp(grid, wavelength, flux, left=0.0, right=0.0)
@@ -40,9 +47,10 @@ def resample_to_ptb_grid(wavelength, flux, s_spec):
 
 
 def fit_linear_device_model(mon_by_channel):
-    """Port PTB's CalibrateFitLinMod for the single-primary-basis case (cal.nPrimaryBases=1):
-    P_device is each channel's spectrum at its highest level; raw_gamma weights are
-    the least-squares projection of each level's spectrum onto that basis (`lstsq`)."""
+    """Port PTB's CalibrateFitLinMod for the single primary basis case
+    (cal.nPrimaryBases=1): P_device is each channel's spectrum at its highest
+    level; raw_gamma weights are the least squares projection of each level's
+    spectrum onto that basis (`lstsq`)."""
     n_channels = len(mon_by_channel)
     n_meas = len(mon_by_channel[0])
     s3 = len(mon_by_channel[0][0])
@@ -66,8 +74,9 @@ def _pchip_sign(v):
 
 
 def _pchip_end_slope(h0, h1, m0, m1):
-    """One-sided three-point derivative estimate, clipped to preserve monotonicity -
-    matches scipy.interpolate.PchipInterpolator's edge-case handling exactly."""
+    """One sided three point derivative estimate, clipped to preserve
+    monotonicity. Matches scipy.interpolate.PchipInterpolator's edge case
+    handling exactly."""
     d = ((2 * h0 + h1) * m0 - h0 * m1) / (h0 + h1)
     if _pchip_sign(d) != _pchip_sign(m0):
         return 0.0
@@ -97,9 +106,9 @@ def _pchip_slopes(x, y):
 
 
 class MonotonePCHIP:
-    """Fritsch-Carlson monotone cubic Hermite interpolation, hand-rolled because scipy
-    has no Android build. Just enough for fit_gamma_curve()'s increasing-x,
-    non-decreasing-y input; returns NaN outside the input range."""
+    """Fritsch Carlson monotone cubic Hermite interpolation, hand rolled because
+    scipy has no Android build. Just enough for fit_gamma_curve()'s increasing x,
+    non decreasing y input; returns NaN outside the input range."""
 
     def __init__(self, x, y):
         self.x = np.asarray(x, dtype=float)
@@ -124,10 +133,10 @@ class MonotonePCHIP:
 
 
 def fit_gamma_curve(gamma_input, raw_gamma, n_output=1024):
-    """Monotone PCHIP interpolation through the measured (input, raw-gamma) points per
-    channel (see module docstring for why this isn't PTB's CalibrateFitGamma). Values
-    forced non-decreasing before fitting; anchored at (0, 0) since level 0 is covered
-    by the separate ambient measurement."""
+    """Monotone PCHIP interpolation through the measured (input, raw gamma) points
+    per channel (see module docstring for why this isn't PTB's CalibrateFitGamma).
+    Values forced non decreasing before fitting; anchored at (0, 0) since level 0
+    is covered by the separate ambient measurement."""
     gamma_output = np.linspace(0.0, 1.0, n_output)
     n_channels = raw_gamma.shape[1]
     table = np.zeros((n_output, n_channels))
@@ -145,9 +154,9 @@ def fit_gamma_curve(gamma_input, raw_gamma, n_output=1024):
 
 
 def build_t_device(wavelength_grid):
-    """CIE 1931 XYZ colour-matching functions at wavelength_grid, as PTB's T_device/
-    T_ambient. Reuses calibration.py's analytic piecewise-Gaussian approximation -
-    close to PTB's tabulated data but not bit-identical."""
+    """CIE 1931 XYZ colour matching functions at wavelength_grid, as PTB's
+    T_device/T_ambient. Reuses calibration.py's analytic piecewise Gaussian
+    approximation. Close to PTB's tabulated data but not bit identical."""
     x = np.array([calibration._piecewise_gaussian(w, calibration.CIE_X_COEFS)
                  for w in wavelength_grid])
     y = np.array([calibration._piecewise_gaussian(w, calibration.CIE_Y_COEFS)
@@ -158,8 +167,8 @@ def build_t_device(wavelength_grid):
 
 
 class PatchWindow(QWidget):
-    """Borderless fullscreen solid-colour window for the sweep. Status text is drawn
-    over a small dark backing panel so it stays readable on any patch colour."""
+    """Borderless fullscreen solid colour window for the sweep. Status text is
+    drawn over a small dark backing panel so it stays readable on any patch."""
 
     def __init__(self, on_cancel):
         super().__init__()
@@ -191,8 +200,8 @@ class PatchWindow(QWidget):
 
 class MonitorCalibrationTab(QWidget):
     """Sweeps a fullscreen patch through R/G/B levels, measuring the display's
-    spectrum (Radiance mode - narrow, aimable FOV pointed at the screen) at each
-    step. Exports a plain CSV or a Psychtoolbox-ready calibration .mat; see the
+    spectrum (Radiance mode: narrow, aimable FOV pointed at the screen) at each
+    step. Exports a plain CSV or a Psychtoolbox ready calibration .mat; see the
     module docstring for the .mat export choices."""
 
     CHANNEL_NAMES = ('Red', 'Green', 'Blue')
@@ -202,28 +211,33 @@ class MonitorCalibrationTab(QWidget):
         super().__init__()
         self.connection = connection
         self.store = store
-        self.comment = ''  # no UI control yet; carried through to the .mat export as-is
+        self.comment = ''  # no UI control yet; carried through to the .mat export as is
         self._cancelled = False
         self._patch_window = None
         self._result = None  # set on a completed sweep; consumed by the Export buttons
         self.worker = None
 
         layout = QVBoxLayout(self)
+        self.unit_banner = UnitBanner()
+        layout.addWidget(self.unit_banner)
         layout.addWidget(wrapped_label(
-            'Point the OSpRad at the screen (Radiance mode - narrow FOV, so aim it at '
-            'roughly where stimuli will appear) and press Start. A fullscreen patch '
-            'steps through black, then each of Red/Green/Blue at a ladder of levels, '
-            "measuring the spectrum at every step - same workflow as CalibrateMonSpd. "
-            'Takes a few minutes; each step needs a moment to auto-expose (longer for dim levels).'))
+            'Point the OSpRad at the screen (Radiance mode: narrow FOV, so aim it '
+            'at roughly where stimuli will appear) and press Start. A fullscreen '
+            'patch steps through black, then each of Red/Green/Blue at a ladder of '
+            'levels, measuring the spectrum at every step, same workflow as '
+            'CalibrateMonSpd. Takes a few minutes; each step needs a moment to '
+            'auto expose (longer for dim levels).'))
 
         settings = QHBoxLayout()
         levels_label = QLabel('Levels per channel')
-        settings.addWidget(levels_label)
+        settings.addWidget(levels_label)  # '?' added below, once levels_tip exists
         self.n_levels_edit = QLineEdit('11')
         self.n_levels_edit.setFixedWidth(50)
         levels_tip = ('Brightness steps per channel (evenly spaced from just above '
-                      'black to full). More = better gamma fit but proportionally longer.')
+                      'black to full). More = better gamma fit but proportionally '
+                      'longer.')
         tip(levels_label, levels_tip)
+        settings.addWidget(help_button(levels_tip))
         tip(self.n_levels_edit, levels_tip)
         settings.addWidget(self.n_levels_edit)
         settings.addSpacing(16)
@@ -231,10 +245,11 @@ class MonitorCalibrationTab(QWidget):
         settings.addWidget(settle_label)
         self.settle_ms_edit = QLineEdit('300')
         self.settle_ms_edit.setFixedWidth(50)
-        settle_tip = ('Pause after each patch colour change, before measuring, so the '
-                      'display has finished redrawing. Raise if your monitor/compositor '
-                      'is slow to settle.')
+        settle_tip = ('Pause after each patch colour change, before measuring, so '
+                      'the display has finished redrawing. Raise if your monitor/'
+                      'compositor is slow to settle.')
         tip(settle_label, settle_tip)
+        settings.addWidget(help_button(settle_tip))
         tip(self.settle_ms_edit, settle_tip)
         settings.addWidget(self.settle_ms_edit)
         settings.addStretch(1)
@@ -258,8 +273,8 @@ class MonitorCalibrationTab(QWidget):
         self.export_ptb_button.clicked.connect(self._export_ptb)
         tip(self.export_ptb_button, (
             'Writes a fitted PsychCal .mat file; load directly with '
-            'cal = LoadCalFile(...) in Psychtoolbox (no MATLAB-side step). '
-            'See the module docstring for the linear-model and tone-curve choices.'))
+            'cal = LoadCalFile(...) in Psychtoolbox (no MATLAB side step). '
+            'See the module docstring for the linear model and tone curve choices.'))
         btn_row.addWidget(self.export_ptb_button)
         btn_row.addStretch(1)
         layout.addLayout(btn_row)
@@ -272,8 +287,15 @@ class MonitorCalibrationTab(QWidget):
 
         self.set_connection(connection)
 
-    def set_connection(self, connection):
+    def apply_theme(self, dark):
+        self.plot.apply_theme(dark)
+
+    def set_connection(self, connection, config=None):
         self.connection = connection
+        if connection is not None and config is not None:
+            self.unit_banner.set_config(config, getattr(self, 'store', None))
+        else:
+            self.unit_banner.set_disconnected()
         self.start_button.setEnabled(connection is not None)
         if not connection:
             self.status.setText('Not connected.')
@@ -296,25 +318,26 @@ class MonitorCalibrationTab(QWidget):
             self.status.setText(str(exc))
             return
 
-        # Downstream USE of an already-calibrated device; block outright (not warn)
+        # Downstream USE of an already calibrated device. Block outright (not warn)
         # until both preconditions below hold. If Dark and Radiance resolve to the
-        # same (or any unsaved) physical angle, every reading is dark-minus-itself.
+        # same (or any unsaved) physical angle, every reading is dark minus itself.
         angles = (config.dark, config.irr, config.rad)
         if any(a < WHEEL_MIN_ANGLE or a > WHEEL_MAX_ANGLE for a in angles):
             QMessageBox.critical(self, 'OSpRad', (
-                "This unit's shutter wheel positions haven't all been saved yet. Finish "
-                'Calibration -> Unit & wheel setup first - without a real Dark position, '
-                'the dark-frame subtraction has nothing meaningful to subtract, so every '
-                'measurement here would be near-zero noise, not a real spectrum.'))
+                "This unit's shutter wheel positions haven't all been saved yet. "
+                'Finish Calibration -> Unit & wheel setup first. Without a real '
+                'Dark position, the dark frame subtraction has nothing meaningful '
+                'to subtract, so every measurement here would be near zero noise, '
+                'not a real spectrum.'))
             return
 
         try:
             self.store.get(config.unit_number)
         except calibration.CalibrationError:
             QMessageBox.critical(self, 'OSpRad', (
-                'Unit #%d has no wavelength/sensitivity/linearisation calibration in '
-                '%s yet. Finish device calibration (Calibration tab) before measuring a '
-                'monitor with it.' % (config.unit_number, self.store.path)))
+                'Unit #%d has no wavelength/sensitivity/linearisation calibration '
+                'in %s yet. Finish device calibration (Calibration tab) before '
+                'measuring a monitor with it.' % (config.unit_number, self.store.path)))
             return
 
         self._cancelled = False
@@ -329,14 +352,14 @@ class MonitorCalibrationTab(QWidget):
         self.export_ptb_button.setEnabled(False)
         self._result = None
 
-        self.connection.set_integration_time(0)  # let each step auto-expose
+        self.connection.set_integration_time(0)  # let each step auto expose
         self._patch_window = PatchWindow(on_cancel=self._cancel)
         self._advance_sweep()
 
     def _build_step_list(self, n_levels):
-        """('ambient' | channel-index, (r,g,b), status text) per step. Gamma levels
-        exclude 0 (linspace(0,1,n+1)[1:]), matching PTB's rawGammaInput convention -
-        black is covered once, separately, by the ambient step."""
+        """('ambient' | channel index, (r,g,b), status text) per step. Gamma levels
+        exclude 0 (linspace(0,1,n+1)[1:]), matching PTB's rawGammaInput
+        convention. Black is covered once, separately, by the ambient step."""
         steps = [('ambient', (0, 0, 0), 'Measuring ambient (black screen)...')]
         gamma_input = np.linspace(0.0, 1.0, n_levels + 1)[1:]
         levels_255 = [int(round(f * 255)) for f in gamma_input]
@@ -356,13 +379,13 @@ class MonitorCalibrationTab(QWidget):
         if self._cancelled:
             return
         self._cancelled = True
-        self.status.setText('Cancelling - finishing current measurement...')
+        self.status.setText('Cancelling; finishing current measurement...')
 
     def _advance_sweep(self):
-        """Only waits via QTimer.singleShot() (never blocks), so the event loop stays
-        responsive to Escape/Cancel for the whole sweep. Worst case: Cancel takes
-        effect after the one measurement already in flight (a blocking serial call
-        can't be safely interrupted mid-read)."""
+        """Only waits via QTimer.singleShot() (never blocks), so the event loop
+        stays responsive to Escape/Cancel for the whole sweep. Worst case:
+        Cancel takes effect after the one measurement already in flight (a
+        blocking serial call can't be safely interrupted mid read)."""
         if self._cancelled:
             self._finish_sweep(outcome='cancelled')
             return
@@ -386,8 +409,8 @@ class MonitorCalibrationTab(QWidget):
 
     @staticmethod
     def _measure_and_resample(kind, connection, store):
-        """Run on a background thread (qt_worker.Worker): hardware I/O and calibration
-        math only; Qt widgets are not thread-safe."""
+        """Run on a background thread (qt_worker.Worker): hardware I/O and
+        calibration math only. Qt widgets are not thread safe."""
         measurement = connection.measure('r')
         calib = store.get(measurement.unit_number)
         flux = calib.to_flux(measurement.raw_counts, 'r', measurement.int_time)
@@ -434,7 +457,7 @@ class MonitorCalibrationTab(QWidget):
             'n_levels': self._n_levels,
         }
         total_steps = len(self._sweep_steps)
-        self.status.setText('Done - %d measurements. Export below, or run another sweep.'
+        self.status.setText('Done, %d measurements. Export below, or run another sweep.'
                             % total_steps)
         self.export_csv_button.setEnabled(True)
         self.export_ptb_button.setEnabled(True)
@@ -452,7 +475,7 @@ class MonitorCalibrationTab(QWidget):
         self.plot._style_axes()
         ax.set_xlabel('Input level (0-255)')
         ax.set_ylabel('Relative luminance (sum of resampled spectrum)')
-        ax.set_title('Gamma sweep preview - should rise smoothly per channel', fontsize=10)
+        ax.set_title('Gamma sweep preview; closer to a smooth curve is better', fontsize=10)
         for ch in range(3):
             totals = [float(np.sum(spd)) for spd in self._result['mon_by_channel'][ch]]
             ax.plot(levels_255, totals, color=self.CHANNEL_COLORS[ch], marker='o',
@@ -465,20 +488,24 @@ class MonitorCalibrationTab(QWidget):
     def _export_csv(self):
         if self._result is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, 'OSpRad', 'monitor_calibration.csv', 'CSV (*.csv)')
+        path, _ = file_io.ask_save_path(
+            self, file_io.default_name('osprad-monitor', 'csv'), 'CSV (*.csv)')
         if not path:
             return
         start, delta, n = self._result['s_spec']
         grid = start + delta * np.arange(n)
-        with open(path, 'w') as handle:
-            handle.write('# channel,level_255,' + ','.join('%.1f' % w for w in grid) + '\n')
-            handle.write('ambient,0,' + ','.join('%.6g' % v for v in self._result['ambient'])
-                        + '\n')
-            for ch, name in enumerate(self.CHANNEL_NAMES):
-                levels_255 = self._result['gamma_input'] * 255
-                for level, spd in zip(levels_255, self._result['mon_by_channel'][ch]):
-                    handle.write('%s,%.1f,' % (name, level)
-                                + ','.join('%.6g' % v for v in spd) + '\n')
+        rows = ['# channel,level_255,' + ','.join('%.1f' % w for w in grid) + '\n',
+                'ambient,0,' + ','.join('%.6g' % v for v in self._result['ambient']) + '\n']
+        for ch, name in enumerate(self.CHANNEL_NAMES):
+            levels_255 = self._result['gamma_input'] * 255
+            for level, spd in zip(levels_255, self._result['mon_by_channel'][ch]):
+                rows.append('%s,%.1f,' % (name, level)
+                            + ','.join('%.6g' % v for v in spd) + '\n')
+        try:
+            file_io.write_text(path, ''.join(rows))
+        except OSError as exc:
+            self.status.setText('Could not write %s: %s' % (path, exc))
+            return
         self.status.setText('Saved %s' % path)
 
     def _export_ptb(self):
@@ -489,7 +516,8 @@ class MonitorCalibrationTab(QWidget):
         except ImportError:
             QMessageBox.critical(self, 'OSpRad', 'scipy is required for the .mat export.')
             return
-        path, _ = QFileDialog.getSaveFileName(self, 'OSpRad', 'monitor_calibration.mat', 'MATLAB file (*.mat)')
+        path, _ = file_io.ask_save_path(
+            self, file_io.default_name('osprad-monitor', 'mat'), 'MATLAB file (*.mat)')
         if not path:
             return
 
@@ -513,9 +541,9 @@ class MonitorCalibrationTab(QWidget):
             'describe': {
                 'S': np.array(s_spec, dtype=float).reshape(1, 3),
                 'caltype': 'monitor',
-        'program': 'OSpRad MonitorCalibrationTab (fit: linear device model ported from '
-                  'PTB CalibrateFitLinMod; tone curve: monotone PCHIP, not PTB '
-                  "CalibrateFitGamma - see monitor_calibration.py module docstring)",
+        'program': 'OSpRad MonitorCalibrationTab (fit: linear device model ported '
+                  'from PTB CalibrateFitLinMod; tone curve: monotone PCHIP, not PTB '
+                  "CalibrateFitGamma; see monitor_calibration.py module docstring)",
                 'date': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'comment': self.comment,
                 'nAverage': 1.0,
@@ -539,6 +567,15 @@ class MonitorCalibrationTab(QWidget):
             'S_ambient': np.array(s_spec, dtype=float).reshape(1, 3),
             'T_ambient': t_device,
         }
-        sio.savemat(path, {'cal': cal})
-        self.status.setText(('Saved %s - a fitted PsychCal file, load directly with '
+        # Into a buffer, then through file_io. savemat can take a file object, and
+        # that is what lets this land on an Android content:// URI rather than a
+        # 0 byte file.
+        buf = io.BytesIO()
+        sio.savemat(buf, {'cal': cal})
+        try:
+            file_io.write_bytes(path, buf.getvalue())
+        except OSError as exc:
+            self.status.setText('Could not write %s: %s' % (path, exc))
+            return
+        self.status.setText(('Saved %s; a fitted PsychCal file, load directly with '
                              'cal = LoadCalFile(...) in Psychtoolbox.' % path))

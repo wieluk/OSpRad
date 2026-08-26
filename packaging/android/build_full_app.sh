@@ -3,10 +3,10 @@
 # (buildozer/python-for-android). Bundles PySide6, numpy, matplotlib, usb4a,
 # usbserial4a, pyjnius and every app/*.py module. scipy is excluded (its p4a recipe
 # doesn't build); see calibration_wizard.py and monitor_calibration.py for the
-# numpy-only fallbacks.
+# numpy only fallbacks.
 #
 # pyside6-android-deploy regenerates buildozer.spec / pysidedeploy.spec every run, so
-# hand-editing them doesn't stick. Everything below is sed-patched into the installed
+# hand editing them doesn't stick. Everything below is sed patched into the installed
 # tool, scoped to the throwaway --work-dir venv:
 #   requirements   numpy/matplotlib/usb4a/usbserial4a/pyjnius + the tool's hardcoded
 #                  list (pyjnius because usb4a/usbserial4a import jnius at runtime
@@ -22,7 +22,7 @@
 #                  tool's own rmtree cleanup, which would otherwise wipe them.
 #   minapi/ndk_api raised to 24, which numpy's recipe requires.
 #
-# Also pre-builds a usbserial4a wheel (PyPI ships sdist-only; p4a's pip runs with
+# Also prebuilds a usbserial4a wheel (PyPI ships sdist only; p4a's pip runs with
 # --only-binary=:all:) and installs the patch/autotools/cmake/bzip2 toolchain via
 # Homebrew if present or apt-get otherwise.
 #
@@ -30,7 +30,7 @@
 #   Output: <work_dir>/osprad_full/*.apk
 #   Env:    OSPRAD_VERSION - version stamped into the APK (default: app/_version.py)
 #   IMPORTANT: keep work_dir short. Recipes invoke a hostpython3 pip whose shebang
-#   embeds the full work_dir path; past the kernel's 127-char shebang limit that
+#   embeds the full work_dir path; past the kernel's 127 char shebang limit that
 #   fails as "Exec format error".
 
 set -euo pipefail
@@ -52,11 +52,11 @@ mkdir -p "$WORK_DIR"
 echo "Work dir: $WORK_DIR"
 echo "Version:  $OSPRAD_VERSION"
 if [ "${#WORK_DIR}" -gt 40 ]; then
-    echo "WARNING: work_dir is long (${#WORK_DIR} chars) - a hostpython3 pip shebang" >&2
-    echo "may exceed the kernel's 127-char limit. Prefer a short path." >&2
+    echo "WARNING: work_dir is long (${#WORK_DIR} chars). A hostpython3 pip shebang" >&2
+    echo "may exceed the kernel's 127 char limit. Prefer a short path." >&2
 fi
 
-echo "=== JDK $JDK_VERSION (Temurin, portable - no system install) ==="
+echo "=== JDK $JDK_VERSION (Temurin, portable; no system install) ==="
 mkdir -p "$WORK_DIR/jdk"
 if [ -z "$(find "$WORK_DIR/jdk" -maxdepth 1 -mindepth 1 -type d -iname 'jdk*')" ]; then
     # /binary/version/<release> rather than /binary/latest/17/ga, so a new Temurin
@@ -79,7 +79,7 @@ fi
 
 echo "=== PySide6/shiboken6 Android wheels ==="
 # pyside6-android-deploy reads the target arch out of the wheel *filename*, so these
-# have to keep their upstream names - renaming them to something tidier makes it fail
+# have to keep their upstream names. Renaming them to something tidier makes it fail
 # with "PySide wheel corrupted. Wheel name should end with platform name".
 mkdir -p "$WORK_DIR/wheels"
 PYSIDE_WHEEL="pyside6-$PYSIDE_VERSION-$PYSIDE_VERSION-cp311-cp311-android_$ARCH.whl"
@@ -148,7 +148,7 @@ sed -i 's/^#android.minapi = 21/android.minapi = 24/' "$DEFAULT_SPEC"
 sed -i 's/^#android.ndk_api = 21/android.ndk_api = 24/' "$DEFAULT_SPEC"
 grep -q "^android.minapi = 24" "$DEFAULT_SPEC" || { echo "minapi patch failed"; exit 1; }
 
-echo "=== Pre-build a local wheel for usbserial4a (PyPI ships sdist-only, pip needs a wheel) ==="
+echo "=== Prebuild a local wheel for usbserial4a (PyPI ships sdist only, pip needs a wheel) ==="
 mkdir -p "$WORK_DIR/wheelhouse"
 "$WORK_DIR/py311/bin/python3" -m pip wheel "usbserial4a==$USBSERIAL4A_VERSION" \
     --no-deps -w "$WORK_DIR/wheelhouse" --quiet
@@ -168,7 +168,7 @@ elif command -v apt-get >/dev/null 2>&1; then
     sudo apt-get install -y -qq patch autoconf automake libtool libltdl-dev cmake libbz2-dev unzip
     BZ2_PREFIX="/usr"
 else
-    echo "Neither brew nor apt-get found - install patch/autoconf/automake/libtool/cmake" >&2
+    echo "Neither brew nor apt-get found. Install patch/autoconf/automake/libtool/cmake" >&2
     echo "and bzip2 dev headers manually, then re-run." >&2
     exit 1
 fi
@@ -177,11 +177,46 @@ echo "=== Staging app source ==="
 mkdir -p "$WORK_DIR/osprad_full"
 cp "$REPO_ROOT/app/OSpRad.py" "$WORK_DIR/osprad_full/main.py"
 for f in analysis.py calibration.py calibration_io.py calibration_wizard.py datalog.py \
-         monitor_calibration.py plotting.py qt_worker.py serial_io.py touch.py \
+         file_io.py monitor_calibration.py plotting.py qt_worker.py serial_io.py touch.py ui.py \
          _version.py _icon_bundled.py _calibration_data_bundled.py; do
     cp "$REPO_ROOT/app/$f" "$WORK_DIR/osprad_full/$f"
 done
 cp "$REPO_ROOT/app/calibration_data.csv" "$WORK_DIR/osprad_full/calibration_data.csv"
+
+# p4a fetches each recipe's source from whatever URL the recipe hardcodes, retries four
+# times over ~15s and then fails the whole build. download.savannah.gnu.org (freetype)
+# goes down for hours at a time and has killed otherwise good builds, so seed p4a's
+# package cache from a mirror first. p4a skips downloading when both the tarball and its
+# .mark-<file> marker are already there.
+#
+# The sha256 is pinned and checked, so a mirror serving something else can't slip a
+# different tarball into the build. Any failure here is non fatal: the build just falls
+# back to p4a's own download, which is what would have happened anyway.
+seed_recipe_source() {
+    local recipe="$1" filename="$2" sha256="$3" url="$4"
+    local dir="$WORK_DIR/osprad_full/.buildozer/android/platform/build-arm64-v8a/packages/$recipe"
+    mkdir -p "$dir"
+    [ -f "$dir/.mark-$filename" ] && [ -f "$dir/$filename" ] && return 0
+    echo "Preseeding $recipe source from a mirror"
+    if ! curl -fsL --retry 3 --connect-timeout 20 -o "$dir/$filename.part" "$url"; then
+        echo "WARNING: could not pre-seed $recipe. Leaving it to p4a." >&2
+        rm -f "$dir/$filename.part"
+        return 0
+    fi
+    if [ "$(sha256sum "$dir/$filename.part" | cut -d' ' -f1)" != "$sha256" ]; then
+        echo "WARNING: $recipe mirror checksum mismatch. Discarding, leaving it to p4a." >&2
+        rm -f "$dir/$filename.part"
+        return 0
+    fi
+    mv "$dir/$filename.part" "$dir/$filename"
+    touch "$dir/.mark-$filename"
+    echo "Seeded $recipe ($filename)"
+}
+
+echo "=== Preseed flaky recipe downloads ==="
+seed_recipe_source freetype freetype-2.10.1.tar.gz \
+    3a60d391fd579440561bf0e7f31af2222bc610ad6ce4d9d7bd2165bca8669110 \
+    "https://downloads.sourceforge.net/project/freetype/freetype2/2.10.1/freetype-2.10.1.tar.gz"
 
 echo "=== Building APK ==="
 export JAVA_HOME
@@ -207,7 +242,19 @@ yes | pyside6-android-deploy -f \
     --ndk-path "$WORK_DIR/android_sdk/android-ndk-$NDK_VERSION"
 set -o pipefail
 
-echo "Done. APK(s):"
 # maxdepth 2 covers both the project dir and buildozer's bin/ subdirectory; it stays
 # shallow enough to skip the unversioned intermediate APK deep inside .buildozer.
-find "$WORK_DIR/osprad_full" -maxdepth 2 -iname "*.apk"
+apks=$(find "$WORK_DIR/osprad_full" -maxdepth 2 -iname "*.apk")
+
+# Don't trust the deploy tool's exit status: it prints a traceback for a failed
+# buildozer run and still exits 0, so set -e never fires and the script would report
+# success with no APK. The failure then surfaced a step later as "no APK produced",
+# pointing at the wrong place. Check for the artifact itself instead.
+if [ -z "$apks" ]; then
+    echo "ERROR: the build produced no APK. See the buildozer output above for the" >&2
+    echo "real error (a recipe download failing is the usual cause)." >&2
+    exit 1
+fi
+
+echo "Done. APK(s):"
+echo "$apks"

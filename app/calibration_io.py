@@ -1,12 +1,15 @@
-# Export/import a unit's calibration as one JSON file - both the CSV data and the
-# wheel positions in EEPROM, since either half alone is useless and they're easy to
-# lose separately. Every section is optional, so import merges into what the unit
-# already has rather than replacing it.
+# Export/import a unit's calibration as one JSON file: both the CSV data and the
+# wheel positions in EEPROM, since either half alone is useless and they are easy
+# to lose separately. Every section is optional, so import merges into what the
+# unit already has rather than replacing it.
 
 import datetime
 import json
+import logging
 
 import calibration
+
+log = logging.getLogger('osprad.calibration_io')
 
 FORMAT_NAME = 'osprad-calibration'
 FORMAT_VERSION = 1
@@ -25,7 +28,8 @@ FIELD_LABELS = {
 }
 
 WHEEL_ROLES = ('dark', 'irr', 'rad')
-# Export keys -> the single-letter role the firmware uses (serial_io.save_wheel_position).
+# Export keys -> the single letter role the firmware uses
+# (serial_io.save_wheel_position).
 WHEEL_ROLE_LETTERS = {'dark': 'D', 'irr': 'I', 'rad': 'R'}
 
 
@@ -34,8 +38,8 @@ class CalibrationIOError(Exception):
 
 
 class ImportedCalibration:
-    """One parsed export file. `values` holds only the CSV sections the file actually
-    contains, so `available_fields()` is what the import UI offers to apply."""
+    """One parsed export file. `values` holds only the CSV sections the file
+    actually contains, so `available_fields()` is what the import UI offers."""
 
     def __init__(self, unit_number, values, wheel, exported):
         self.unit_number = unit_number
@@ -52,7 +56,7 @@ class ImportedCalibration:
 
 def build_export(calib, config=None, fields=None):
     """Serialise a unit's calibration, including only `fields` (default: everything).
-    config is an optional serial_io.UnitConfig for the Arduino-side wheel positions."""
+    config is an optional serial_io.UnitConfig for the Arduino side wheel positions."""
     if fields is None:
         fields = ALL_FIELDS
     fields = set(fields)
@@ -77,31 +81,33 @@ def build_export(calib, config=None, fields=None):
     return data
 
 
-def write_file(path, calib, config=None, fields=None):
-    with open(path, 'w') as handle:
-        json.dump(build_export(calib, config, fields), handle, indent=2)
+def dumps(calib, config=None, fields=None):
+    """Serialise an export to JSON text; the caller writes it through file_io."""
+    data = build_export(calib, config, fields)
+    log.debug('Exporting unit #%s: %s', data.get('unit_number'),
+              [k for k in data if k not in ('format', 'version', 'exported', 'unit_number')])
+    return json.dumps(data, indent=2)
 
 
-def read_file(path):
-    """Parse and fully validate an export file, returning an ImportedCalibration.
+def loads(text, source='the file'):
+    """Parse and fully validate export text, returning an ImportedCalibration.
 
-    Validation is strict and happens entirely before anything is written anywhere: an
-    import overwrites a real unit's calibration and can push wheel angles to the
-    Arduino's EEPROM, so a half-applied import from a truncated or hand-edited file
+    Validation is strict and happens entirely before anything is written anywhere.
+    An import overwrites a real unit's calibration and can push wheel angles to the
+    Arduino's EEPROM, so a half applied import from a truncated or hand edited file
     would be worse than a rejected one.
     """
     try:
-        with open(path) as handle:
-            data = json.load(handle)
-    except (OSError, ValueError) as exc:
-        raise CalibrationIOError('Could not read %s: %s' % (path, exc)) from exc
+        data = json.loads(text)
+    except ValueError as exc:
+        raise CalibrationIOError('Could not read %s: %s' % (source, exc)) from exc
 
     if not isinstance(data, dict) or data.get('format') != FORMAT_NAME:
         raise CalibrationIOError(
             'This is not an OSpRad calibration file (expected a "%s" JSON file).' % FORMAT_NAME)
     if data.get('version') != FORMAT_VERSION:
         raise CalibrationIOError(
-            'Unsupported calibration file version %r - this app writes and reads version %d.'
+            'Unsupported calibration file version %r; this app writes and reads version %d.'
             % (data.get('version'), FORMAT_VERSION))
 
     try:
@@ -123,7 +129,7 @@ def read_file(path):
             values[key] = [float(v) for v in raw]
         except (TypeError, ValueError) as exc:
             raise CalibrationIOError(
-                'Calibration file\'s "%s" contains non-numeric values.' % key) from exc
+                'Calibration file\'s "%s" contains non numeric values.' % key) from exc
 
     wheel = data.get(WHEEL_FIELD)
     if wheel is not None:
@@ -144,14 +150,16 @@ def read_file(path):
     if not values and wheel is None:
         raise CalibrationIOError('Calibration file contains no calibration data at all.')
 
+    log.debug('Imported unit #%d from %s: %s', unit_number, source,
+              sorted(values) + ([WHEEL_FIELD] if wheel else []))
     return ImportedCalibration(unit_number, values, wheel, data.get('exported'))
 
 
 def merge(store, imported, fields):
-    """Build the CalibrationSet that importing `fields` would produce, without saving it.
+    """Build the CalibrationSet that importing `fields` would produce, without saving.
 
-    Returns a brand-new CalibrationSet rather than mutating the one already in the
-    store: CalibrationSet caches wavelengths derived from wavCoef on first use, so
+    Returns a brand new CalibrationSet rather than mutating the one already in the
+    store. CalibrationSet caches wavelengths derived from wavCoef on first use, so
     overwriting wavCoef in place would leave that cache stale.
     """
     selected = [key for key in CSV_FIELDS if key in fields and key in imported.values]
@@ -186,9 +194,9 @@ def merge(store, imported, fields):
 def apply_wheel_positions(connection, wheel):
     """Push imported wheel angles to the Arduino's EEPROM.
 
-    The firmware's save commands ('sD'/'sI'/'sR') store whatever angle the wheel is
-    *currently* at rather than taking one as an argument, so each role is jogged in
-    place first - the wheel physically moves three times.
+    The firmware's save commands ('sD'/'sI'/'sR') store whatever angle the wheel
+    is currently at rather than taking one as an argument, so each role is jogged
+    in place first. The wheel physically moves three times.
     """
     for role in WHEEL_ROLES:
         connection.jog_wheel(wheel[role])
