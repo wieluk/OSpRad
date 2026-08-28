@@ -4,8 +4,8 @@ An open source, low cost, high sensitivity spectroradiometer. Built around the
 Hamamatsu C12880MA chip. Covers roughly 310 to 880 nm at about 9 nm resolution, with
 tested sensitivity down to ~0.001 cd/sqm (radiance) and ~0.005 lx (irradiance).
 
-Developed by Jolyon Troscianko, 2022. Released under GPL 3.0, without warranty of any
-kind.
+A heavily modified fork of OSpRad. Free software under GPL 3.0, without warranty of
+any kind. See [License and credits](#license-and-credits).
 
 This repository holds the STL files for the housing, the Arduino Nano firmware, and a
 Python app for Windows, macOS, Linux, and Android.
@@ -189,3 +189,12 @@ checkout.
 `[.github/workflows/package.yml](.github/workflows/package.yml)` runs the checks,
 builds every platform, attaches the artifacts to a GitHub Release, and publishes
 the wheel to PyPI.
+
+## License and credits
+
+OSpRad is free software under the GNU General Public License v3.0 (see `LICENSE`),
+and comes with no warranty of any kind.
+
+Original OSpRad by Jolyon Troscianko, 2022
+([troscianko/OSpRad](https://github.com/troscianko/OSpRad)). This repository is a
+fork that has since been heavily modified (2026).
