@@ -18,12 +18,12 @@ PIXELS = 288
 # Untrimmed it would flush the whole 500 line log widget in one go.
 _LOG_REPLY_CHARS = 120
 
-# How long a single measurement may take, from the firmware's own limits: in near
-# darkness auto exposure never saturates, so intTime clamps to maxIntTime (60s) and
-# nScans floors at nScansMin (3), and above sampleTimeMax the firmware interleaves
-# a dark scan with every light scan. That is 3 x (60s + 60s), plus the ~9s
-# exposure ramp and six servo moves. The old 90s timeout could not even cover one
-# such scan, so a dark measurement timed out, retried, and moved the wheel for
+# How long a single measurement may take, from the firmware's own limits: in
+# near darkness auto exposure never saturates, so intTime clamps to maxIntTime
+# (60s) and nScans floors at nScansMin (3). Above sampleTimeMax the firmware
+# interleaves a dark scan with every light scan: 3 x (60s + 60s), plus the ~9s
+# exposure ramp and six servo moves. The old 90s timeout could not even cover
+# one such scan, so a dark measurement timed out and moved the wheel for
 # minutes before failing.
 MEASURE_TIMEOUT = 420
 
@@ -39,16 +39,23 @@ COMMAND_TIMEOUT = 90
 REQUIRED_FIRMWARE_MAJOR = 3
 FIRMWARE_HINT = 'firmware/OSpRad_firmware'
 
-# Sensor self test verdict: roughness (spatial, adjacent pixels within one scan)
-# divided by repeat (temporal, the same pixel across two scans 150ms apart).
+# Firmware that added the live measure command ('l' + mode). It reuses the dark
+# reference from the previous measurement instead of moving the wheel to posDark
+# and re scanning it, which is what makes continuous mode refresh in fractions of
+# a second. Older firmware just measures normally.
+LIVE_MEASURE_FIRMWARE = (3, 3, 0)
+
+# Sensor self test verdict: roughness (spatial, adjacent pixels within one
+# scan) divided by repeat (temporal, the same pixel across two scans 150ms apart).
 #
-# A connected sensor's readout repeats, because its pixel to pixel fixed pattern
-# is a physical property, so repeat is read noise only and the ratio lands near or
-# above 1. A floating VIDEO pin picks up slow drifting interference: uncorrelated
-# scan to scan, so repeat runs to tens of counts while roughness stays around 1,
-# giving a ratio near 0.03. Being a ratio, it doesn't care about light level,
-# integration time or wheel position, which is why the absolute roughness
-# threshold it replaced read "not detected" on working units measuring in the dark.
+# A connected sensor's readout repeats, because its pixel to pixel fixed
+# pattern is a physical property, so repeat is read noise only and the ratio
+# lands near or above 1. A floating VIDEO pin picks up slow drifting
+# interference: uncorrelated scan to scan, so repeat runs to tens of counts
+# while roughness stays around 1, giving a ratio near 0.03. Being a ratio, it
+# does not care about light level, integration time or wheel position, which
+# is why the absolute roughness threshold it replaced read "not detected" on
+# working units measuring in the dark.
 SENSOR_REPEAT_RATIO_THRESHOLD = 0.5
 
 # Floor on the divisor: repeat can legitimately be 0.00 on a quiet connected unit.
@@ -78,16 +85,15 @@ def _patch_usbserial4a_ftdi():
     cdcacm/ch34x/cp210x siblings don't:
 
     1. It derives the last packet's payload length as `(total % maxPacketSize) - 2`,
-       which goes negative on a read that is an exact multiple of the packet size,
-       failing its own `if count > 0` guard and silently dropping 62 bytes. Reads
-       are capped at 1024, an exact multiple of 64, so every full read lost 62
-       bytes. Short replies fit in one packet; a measurement's ~2.3KB DATA line
-       did not, which is why only measurements ever failed their checksum.
+       which goes negative on a read that is an exact multiple of the packet
+       size, failing its own `if count > 0` guard and silently dropping 62 bytes.
+       Reads are capped at 1024, an exact multiple of 64, so every full read
+       lost 62 bytes. Short replies fit in one packet; a measurement's ~2.3KB
+       DATA line did not, which is why only measurements ever failed their checksum.
     2. It raised SerialException when its hardcoded 5s bulkTransfer timeout
        expired, but the firmware is legitimately silent far longer while
        measuring. Returning no data and letting SerialConnection's own timeout
-       govern (MEASURE_TIMEOUT for a measurement) is pyserial's contract and what
-       the other three drivers do.
+       govern is pyserial's contract and what the other three drivers do.
     """
     from usbserial4a import ftdiserial4a
     from usbserial4a.utilserial4a import PortNotOpenError, SerialException
@@ -198,6 +204,18 @@ class Measurement:
         self.raw_counts = raw_counts
 
 
+def _version_tuple(text):
+    """'3.3.0' -> (3, 3, 0). Unparseable text returns () so an unknown firmware is
+    treated as the older one (compares below every real version)."""
+    parts = []
+    for piece in str(text).split('.'):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            return ()
+    return tuple(parts)
+
+
 def list_ports():
     if IS_ANDROID:
         return [d.getDeviceName() for d in usb.get_usb_device_list()]
@@ -253,6 +271,8 @@ class SerialConnection:
         self._lock = threading.Lock()
         # Per connection so the Settings tab can change it without a reconnect.
         self.measure_timeout = MEASURE_TIMEOUT
+        # Filled in by get_config(). Gates the live measure command below.
+        self.firmware_version = ()
         log.info('Opening %s at 115200 (timeout %ss)', port, timeout)
 
         if IS_ANDROID:
@@ -415,7 +435,7 @@ class SerialConnection:
                 key, _, value = part.partition(':')
                 fields[key] = value
         try:
-            return UnitConfig(
+            config = UnitConfig(
                 unit_number=int(fields['unit']),
                 dark=int(fields['dark']),
                 irr=int(fields['irr']),
@@ -425,6 +445,8 @@ class SerialConnection:
             )
         except (KeyError, ValueError) as exc:
             raise SpecProtocolError("Could not read unit config: %s" % line) from exc
+        self.firmware_version = _version_tuple(config.firmware)
+        return config
 
     def _probe_config(self):
         """Send the initial 'g' handshake with a few short timeout retries.
@@ -490,6 +512,11 @@ class SerialConnection:
     def jog_wheel(self, angle):
         self._command("w%d" % angle)
 
+    def park_wheel(self):
+        """Close the shutter. Firmware replies before the servo moves, so this
+        returns in milliseconds while the servo settles in the background."""
+        self._command("p", expect="OK,parked")
+
     def save_wheel_position(self, role):
         self._command("s%s" % role.upper()[0])
 
@@ -500,12 +527,26 @@ class SerialConnection:
         self._command("n%d" % n_min)
         self._command("a%d" % n_max)
 
-    def measure(self, mode, retries=2):
-        """mode: 'r' (radiance) or 'i' (irradiance)."""
-        with self._busy('measure %r' % mode):
-            return self._measure_locked(mode, retries)
+    @property
+    def supports_live_measure(self):
+        """Whether the unit understands the live measure command."""
+        return self.firmware_version >= LIVE_MEASURE_FIRMWARE
 
-    def _measure_locked(self, mode, retries=2):
+    def measure(self, mode, retries=2, live=False):
+        """mode: 'r' (radiance) or 'i' (irradiance).
+
+        live=True asks the firmware to reuse the dark reference it already holds,
+        skipping the move to the dark position and its block of scans. Only the
+        speed changes; the reply is the same DATA line, and the firmware falls
+        back to a full measurement whenever the cached dark does not match this
+        exposure. Silently ignored on firmware older than LIVE_MEASURE_FIRMWARE,
+        so callers never have to check.
+        """
+        command = ('l' + mode) if (live and self.supports_live_measure) else mode
+        with self._busy('measure %r' % command):
+            return self._measure_locked(command, retries)
+
+    def _measure_locked(self, command, retries=2):
         original_timeout = self._ser.timeout
         # A measurement is the one exchange that can legitimately run for minutes.
         timeout = self.measure_timeout
@@ -514,9 +555,9 @@ class SerialConnection:
             for attempt in range(retries + 1):
                 try:
                     log.debug('-> measure %r (attempt %d/%d, timeout %ds)',
-                              mode, attempt + 1, retries + 1, timeout)
+                              command, attempt + 1, retries + 1, timeout)
                     started = time.time()
-                    self._write(str.encode(mode + '\n'))
+                    self._write(str.encode(command + '\n'))
                     measurement = self._parse_measurement(self._readline())
                     log.debug('<- measurement in %.1fs', time.time() - started)
                     return measurement

@@ -1,7 +1,7 @@
 # Unit setup and calibration tabs, embedded in the main window's Calibration tab.
 # Each tab is a self contained QWidget built once at startup and kept alive for
 # the app's lifetime. set_connection() handles the connection going from None to
-# a real SerialConnection and back across a Reconnect.
+# a real SerialConnection, and back across a Reconnect.
 
 import logging
 import math
@@ -317,8 +317,8 @@ class LinearisationTab(QWidget):
         mode_tip = ('Which quantity the sweep measures. Pick one, then press Run '
                     'measurements.\n\n'
                     'Radiance uses the clear aperture (a narrow, aimable view); '
-                    'irradiance uses the cosine diffuser. Linearity is a property of '
-                    'the sensor, so either works. Use whichever suits the steady '
+                    'irradiance uses the cosine diffuser. Linearity is a sensor '
+                    'property, so either works. Pick whichever suits the steady '
                     'source you have set up.')
         tip(mode_label, mode_tip)
         controls.addWidget(captioned(mode_label, mode_tip))
@@ -368,7 +368,7 @@ class LinearisationTab(QWidget):
         self.run_button.setEnabled(False)
         self.save_button.setEnabled(False)
         try:
-            samples = self._collect()
+            samples, too_bright, too_dim, n_attempted, ref_time = self._collect()
         except serial_io.SpecError as exc:
             self.status.setText(str(exc))
             return
@@ -376,9 +376,8 @@ class LinearisationTab(QWidget):
             self.run_button.setEnabled(True)
 
         if len(samples) < 3:
-            self.status.setText('Not enough usable measurements; try a brighter or '
-                                'dimmer source so the sensor is neither dark nor '
-                                'saturated.')
+            self.status.setText(
+                self._exposure_diagnosis(too_bright, too_dim, n_attempted, ref_time))
             return
 
         unit_number = samples[0][2]
@@ -388,11 +387,33 @@ class LinearisationTab(QWidget):
             self.status.setText(str(exc))
             return
         self.result = (unit_number, coefs)
+        spread = self._flatness(samples, coefs)
         self.status.setText('Unit #%d: fitted a = %.5f, b = %.5f from %d integration '
-                            'times. A good fit gives near horizontal lines below.'
-                            % (unit_number, coefs[0], coefs[1], len(samples)))
+                            'times. %s'
+                            % (unit_number, coefs[0], coefs[1], len(samples),
+                               self._quality_verdict(spread)))
         self._show(samples, coefs)
         self.save_button.setEnabled(True)
+
+    @staticmethod
+    def _exposure_diagnosis(too_bright, too_dim, n_attempted, ref_time):
+        """Turn the sweep's discard counts into a specific, actionable reason
+        instead of a generic 'try brighter or dimmer'."""
+        if too_bright and too_bright >= too_dim:
+            return ('Too bright: %d of %d exposures saturated, even at short '
+                    'integration times. Move the source further away or diffuse '
+                    'it, then try again.' % (too_bright, n_attempted))
+        if too_dim:
+            return ('Too dim: %d of %d exposures were too weak to register. Move '
+                    'the source closer, use a brighter one, or check it is aimed '
+                    'straight at the sensor, then try again.' % (too_dim, n_attempted))
+        if n_attempted < 3:
+            return ('Only %d distinct integration times near the %d ms auto '
+                    'exposed reference; too coarse a sweep. Try a source of '
+                    'different brightness so it spans a wider range.'
+                    % (n_attempted, ref_time))
+        return ('Not enough usable measurements; the source may be flickering or '
+                'unsteady. Try a steadier source (daylight or an incandescent lamp).')
 
     def _collect(self):
         mode = self._mode()
@@ -408,6 +429,8 @@ class LinearisationTab(QWidget):
                             for f in (0.05, 0.1, 0.2, 0.35, 0.55, 0.75, 1.0)})
 
         samples = []
+        too_bright = 0
+        too_dim = 0
         for index, int_time in enumerate(int_times, 1):
             self.status.setText('Measuring %d of %d at %d ms...'
                                 % (index, len(int_times), int_time))
@@ -416,13 +439,16 @@ class LinearisationTab(QWidget):
             self.connection.set_integration_time(int_time)
             measurement = self.connection.measure(mode)
             counts = np.asarray(measurement.raw_counts)
-            if measurement.saturated > 2 or counts.max() < 20:
-                continue  # over exposed or too dark to be useful
-            samples.append((int_time, counts, measurement.unit_number))
+            if measurement.saturated > 2:
+                too_bright += 1
+            elif counts.max() < 20:
+                too_dim += 1
+            else:
+                samples.append((int_time, counts, measurement.unit_number))
 
         self.connection.set_integration_time(0)
         self.status.setText('')
-        return samples
+        return samples, too_bright, too_dim, len(int_times), reference.int_time
 
     @staticmethod
     def _usable_mask(counts):
@@ -468,13 +494,43 @@ class LinearisationTab(QWidget):
         a = 1.0 / math.log((SAT_VALUE + 1) * b)
         return [a, b]
 
-    def _show(self, samples, coefs):
+    @classmethod
+    def _normalised_rates(cls, samples, coefs):
+        """Per usable photosite raw and linearised signal per ms, each normalised
+        to its own mean across the sweep. Flat (near 1.0 throughout) is good."""
         times = np.array([t for t, _, _ in samples], dtype=float)
         counts = np.stack([c for _, c, _ in samples])
-        mask = self._usable_mask(counts)
+        mask = cls._usable_mask(counts)
         usable = mask.all(axis=0)
         if usable.sum() < 5:
             usable = mask.sum(axis=0) >= max(2, len(samples) - 1)
+
+        raw_rate = counts[:, usable] / times[:, None]
+        linear = np.array([[calibration.linearize(v, coefs) for v in row]
+                           for row in counts[:, usable]])
+        lin_rate = linear / times[:, None]
+        return times, raw_rate / raw_rate.mean(axis=0), lin_rate / lin_rate.mean(axis=0)
+
+    @classmethod
+    def _flatness(cls, samples, coefs):
+        """RMS spread of the linearised, per pixel normalised signal across the
+        sweep. 0 is perfectly flat; large values mean the plotted lines are not
+        flat, so the fit is unlikely to be trustworthy regardless of the numbers."""
+        _, _, lin_norm = cls._normalised_rates(samples, coefs)
+        return float(np.std(lin_norm))
+
+    @staticmethod
+    def _quality_verdict(spread):
+        if spread < 0.02:
+            return 'Flat — this fit should be reliable.'
+        if spread < 0.06:
+            return 'Mostly flat with some spread — probably usable, but check the plot.'
+        return ('Not flat — this fit is unlikely to be reliable. The source was '
+                'probably unsteady, drifting, or misaligned; try again with a '
+                'steadier or better aimed source before saving.')
+
+    def _show(self, samples, coefs):
+        times, raw_norm, lin_norm = self._normalised_rates(samples, coefs)
 
         ax = self.plot.ax
         ax.clear()
@@ -484,17 +540,11 @@ class LinearisationTab(QWidget):
         ax.set_title('Linearisation check; flat is good', fontsize=10)
 
         # Plot only photosites well exposed at every step, so each line spans the sweep.
-        raw_rate = counts[:, usable] / times[:, None]
-        linear = np.array([[calibration.linearize(v, coefs) for v in row]
-                           for row in counts[:, usable]])
-        lin_rate = linear / times[:, None]
-
-        step = max(1, raw_rate.shape[1] // 40)
-        for series, color, label in ((raw_rate, '#d1495b', 'raw counts'),
-                                      (lin_rate, '#2e86ab', 'linearised')):
-            normalised = series / series.mean(axis=0)
+        step = max(1, raw_norm.shape[1] // 40)
+        for series, color, label in ((raw_norm, '#d1495b', 'raw counts'),
+                                      (lin_norm, '#2e86ab', 'linearised')):
             for column in range(0, series.shape[1], step):
-                ax.plot(times, normalised[:, column], color=color, alpha=0.35, linewidth=0.9)
+                ax.plot(times, series[:, column], color=color, alpha=0.35, linewidth=0.9)
             ax.plot([], [], color=color, label=label)
         ax.set_xscale('log')
         ax.legend(fontsize=9)
@@ -577,8 +627,9 @@ class SensitivityTab(QWidget):
         rescale_layout = QVBoxLayout(rescale)
         rescale_layout.addWidget(wrapped_label(
             'If you have one trusted reading. Keeps the existing spectral shape and '
-            'only corrects its overall level: measure a source whose luminance (cd/sqm) '
-            'or illuminance (lux) you already know, and enter that value here.'))
+            'only corrects its overall level: measure a source whose luminance '
+            '(cd/sqm) or illuminance (lux) you already know, and enter that value '
+            'here.'))
         rescale_row = QHBoxLayout()
         rescale_row.addWidget(QLabel('Known value'))
         self.reference_value_edit = QLineEdit()
@@ -653,7 +704,7 @@ class SensitivityTab(QWidget):
         if measurement.saturated > 0:
             self.status.setText(
                 'Measurement is over exposed (%g saturated photosites), so it cannot '
-                'be used for calibration. Dim the source, or set a shorter '
+                'be used for calibration. Dim the source or set a shorter '
                 'integration time on the main window.' % measurement.saturated)
             return False
         return True
@@ -1122,7 +1173,7 @@ class CalibrationTransferTab(QWidget):
             self.unit_number_edit.clear()
             self.status.setText(
                 'Not connected; exports cover calibration_data.csv only. The unit '
-                'number and wheel positions can\'t be read or written.')
+                'number and wheel positions cannot be read or written.')
             return
         self.status.setText('')
         if config is None:

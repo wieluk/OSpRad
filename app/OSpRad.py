@@ -50,9 +50,9 @@ def _user_data_dir():
     return path
 
 
-# Where calibration_data.csv and data.csv live. Resolved against this file so the app
-# behaves the same however it is launched; see pyproject.toml for the py modules layout
-# that motivates the per user fallback below.
+# Where calibration_data.csv and data.csv live. Resolved against this file so
+# the app behaves the same however it is launched; see pyproject.toml for the
+# py modules layout that motivates the per user fallback below.
 if getattr(sys, 'frozen', False):
     # __file__ points inside the PyInstaller bundle, which onefile deletes on exit.
     _exe_dir = os.path.dirname(sys.executable)
@@ -81,8 +81,8 @@ if not os.path.exists(CALIBRATION_FILE):
             with open(CALIBRATION_FILE, 'w', newline='') as f:
                 f.write(_bundled_csv_text)
 
-# Cap on the scrolling log widget so an unattended "Repeat every (s)" session doesn't
-# grow unboundedly; QPlainTextEdit trims from the top past this.
+# Cap on the scrolling log widget so an unattended "Repeat every (s)" session
+# does not grow unboundedly; QPlainTextEdit trims from the top past this.
 # First entry of the port combo; any other entry is a literal port name to connect to.
 PORT_AUTO = 'Auto detect'
 
@@ -96,13 +96,41 @@ HEARTBEAT_MS = 5000
 # How long a measurement runs before the status explains itself.
 MEASURE_SLOW_HINT_SECONDS = 20
 
+# Continuous mode: pause between one update and the next. Not a throttle (a
+# measurement is orders of magnitude slower); it just hands the event loop a
+# beat to repaint the canvas and notice a Stop press between frames.
+CONTINUOUS_GAP_MS = 50
+
+# Per update time past which continuous mode explains how to speed itself up.
+CONTINUOUS_SLOW_SECONDS = 5
+
+# Continuous mode drives the exposure itself, because the firmware's dark
+# cache is keyed on it. Auto exposure and a live plot are mutually exclusive.
+#
+# Target peak, and the band around it that is left alone. The band is wide on
+# purpose: re exposing costs a full measurement, so it has to be worth it.
+CONTINUOUS_TARGET_PEAK = 500
+CONTINUOUS_PEAK_LOW = 120
+CONTINUOUS_PEAK_HIGH = 850
+# Bounds on the exposure it may choose, from the firmware's own auto exposure ceiling.
+CONTINUOUS_EXPOSURE_MIN = 1
+CONTINUOUS_EXPOSURE_MAX = 5000
+# Cap on how far one step may move, so one odd reading cannot swing the
+# exposure to a value that takes several seconds to recover from.
+CONTINUOUS_EXPOSURE_STEP = 8
+
+# How often a continuous run gives up the firmware's cached dark reference
+# and takes a full measurement instead. Dark current follows sensor temperature,
+# so expiring it is the app's job.
+CONTINUOUS_DARK_REFRESH_SECONDS = 30
+
 LOG_MAX_LINES = 500
 LOG_LEVELS = ('debug', 'info', 'warning', 'error')
 LOG_LEVEL_RANK = {level: i for i, level in enumerate(LOG_LEVELS)}
 LOG_COLORS = {'error': '#d1495b', 'warning': '#e9a23a', 'debug': '#7a7a7a'}
 
 # Root of the logger tree the non GUI modules log into (serial_io, datalog, ...).
-# They use stdlib logging so they don't have to import the GUI or be handed a callback.
+# They use stdlib logging so they do not have to import the GUI or be handed a callback.
 LOGGER_NAME = 'osprad'
 
 
@@ -110,8 +138,8 @@ class _LogBridge(QObject):
     """Carries log records from any thread onto the GUI thread.
 
     Signal.emit is thread safe and Qt queues cross thread connections, so records
-    logged from the measurement worker arrive on the GUI thread before they touch
-    the log widget. A handler calling _log() directly would corrupt QPlainTextEdit.
+    logged from the worker arrive on the GUI thread before they touch the log
+    widget. A handler calling _log() directly would corrupt QPlainTextEdit.
     """
     message = Signal(str, str)
 
@@ -130,6 +158,7 @@ class _QtLogHandler(logging.Handler):
                                   'error' if level == 'critical' else level)
 
 # Hand rolled replacement for sv_ttk (Tkinter only); "role" colours match the old styles.
+# (Qt stylesheet syntax: the .in py form below is a single big string.)
 LIGHT_QSS = """
 QWidget { background-color: #fafafa; color: #1c1c1c; }
 QLineEdit, QPlainTextEdit, QTreeWidget, QComboBox { background-color: #ffffff; }
@@ -172,8 +201,8 @@ QGroupBox::indicator:disabled { border-color: #4a4a4a; }
 """
 
 
-# QSettings keys. Nothing used to persist, so every launch started light themed at
-# log level "info" with the port re detected from scratch.
+# QSettings keys. Nothing used to persist, so every launch started light themed
+# at log level "info" with the port re detected from scratch.
 SETTING_DARK_MODE = 'ui/dark_mode'
 SETTING_LOG_LEVEL = 'log/level'
 SETTING_PORT = 'serial/preferred_port'
@@ -251,12 +280,11 @@ class _ReadingItem(QTreeWidgetItem):
 
 def _make_scroll_tab(content):
     """Wrap a tab in a QScrollArea (so a tall tab scrolls instead of clipping) with
-    QScroller panning so a single finger touch drag works on phone screens.
+    QScroller panning for one finger touch drag on phones.
 
-    Vertical only. Tabs are laid out to fit the width, so any horizontal movement is
-    just drift, which takes both turning the scrollbar off (content is then sized to
-    the viewport width) and turning off QScroller's horizontal overshoot, since the
-    kinetic scroller rubber bands sideways even with nothing to scroll to.
+    Vertical only. Horizontal movement is just drift: it takes turning off the
+    scrollbar AND turning off QScroller's horizontal overshoot, since the kinetic
+    scroller rubber bands sideways even with nothing to scroll to.
     """
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
@@ -278,9 +306,8 @@ class _PlotToolbar(NavigationToolbar2QT):
 
     Its save calls figure.savefig(path) directly, which cannot write to an Android
     content:// URI and so produced 0 byte files there. The app's own "Save figure..."
-    goes through file_io instead, and one save route per plot avoids two buttons
-    that behave differently. Filtering by name rather than index so a matplotlib
-    update that reorders the toolbar can't silently drop the wrong tool.
+    goes through file_io. Filtering by name rather than index so a matplotlib
+    update that reorders the toolbar cannot silently drop the wrong tool.
     """
     toolitems = [item for item in NavigationToolbar2QT.toolitems if item[0] != 'Save']
 
@@ -323,6 +350,32 @@ class OSpRadApp(QMainWindow):
         self._repeat_next_time = None
         self._repeat_queue = []
         self._repeat_interval_secs = 300
+        self._repeat_run = 0
+        self._repeat_round = 0
+        self._repeat_base = 'auto'
+        self._repeat_both_modes = False
+        self._repeat_mode = 'i'
+
+        self._continuous_running = False
+        self._continuous_queue = []
+        self._continuous_frames = 0
+        self._continuous_frame_started = 0.0
+        self._continuous_slow_hinted = False
+        # When the firmware last took a dark reference for this run. None until the
+        # first full measurement of the run has started.
+        self._continuous_dark_time = None
+        # Measurement settings continuous mode borrowed, to hand back on stop.
+        self._continuous_saved_settings = None
+        # Whether it is choosing the exposure itself (the user left it on auto).
+        self._continuous_manages_exposure = False
+        # Whether this run has actually skipped a dark re reference, which is what
+        # makes its readings unfit for the history.
+        self._continuous_held_dark = False
+        # Whether the measurement in flight is one of those.
+        self._measure_unsaveable = False
+        # Set when the shutter has been left open and should be closed as soon as
+        # the link is free. See _park_wheel.
+        self._park_pending = False
 
         self._prev_int_time = None
         self._prev_scans = None
@@ -334,6 +387,10 @@ class OSpRadApp(QMainWindow):
         # Guards _update_controls against running mid construction, when the widgets
         # from later tabs don't exist yet.
         self._ui_ready = False
+        # Populated by _build_main_tab; read by _sync_sections and _set_save_error,
+        # both of which can run before it exists.
+        self._sections = {}
+        self._section_switching = False
         self._connect_worker = None
         self._connect_port = None
         self._measure_worker = None
@@ -374,6 +431,63 @@ class OSpRadApp(QMainWindow):
         tabs.addTab(_make_scroll_tab(self._build_settings_tab()), 'Settings')
         self._ui_ready = True
         self._refresh_log_level_hint()
+        self._sync_sections()
+
+    def _running_section(self):
+        """Which section, if any, currently owns the hardware."""
+        if self._continuous_running:
+            return 'continuous'
+        if self._repeat_running:
+            return 'repeat'
+        return None
+
+    def _on_section_toggled(self, name, checked):
+        """Keep exactly one of Measurement, Continuous mode and Automatic repeat open.
+
+        Qt's checkable QGroupBox has no notion of a group, so the mutual
+        exclusion lives here. setChecked below re enters this handler, hence the guard.
+        """
+        if self._section_switching:
+            return
+        self._section_switching = True
+        try:
+            running = self._running_section()
+            if running is not None and name != running:
+                # A run owns its section: folding it away would take its Stop
+                # button with it. Refuse the switch rather than strand the run.
+                self._sections[name].setChecked(False)
+                self._sections[running].setChecked(True)
+            elif checked:
+                for other, box in self._sections.items():
+                    if other != name:
+                        box.setChecked(False)
+            elif not any(box.isChecked() for box in self._sections.values()):
+                # Closing the last open one would leave the tab with no mode at all.
+                self._sections[name].setChecked(True)
+        finally:
+            self._section_switching = False
+        self._sync_sections()
+
+    def _sync_sections(self):
+        """Show the settings and save controls that belong to the open section."""
+        if not self._ui_ready:
+            return
+        continuous = self._sections['continuous'].isChecked()
+        repeat = self._sections['repeat'].isChecked()
+        # Continuous mode takes exposure and scan count over for the run and saves
+        # nothing, so neither box has anything to offer there.
+        self._settings_box.setVisible(not continuous)
+        self._save_box.setVisible(not continuous)
+        self._save_box.setTitle('Save readings' if repeat else 'Save reading')
+        self.bt_save.setVisible(not repeat)
+        self.save_hint_label.setText(
+            'Every reading the run saves is named after this label with a number '
+            'after it, so "lamp" becomes lamp_1, lamp_2, and so on.' if repeat else
+            'Names this reading in the History tab.')
+        self._set_save_error(self.save_error_label.text(),
+                             self.save_error_label.property('role') or 'bad')
+        # Unfolding a checkable QGroupBox re enables every child, which would offer
+        # a Stop for a loop that isn't running. Re deriving the states undoes that.
         self._update_controls()
 
     def _hardware_tabs(self):
@@ -427,11 +541,11 @@ class OSpRadApp(QMainWindow):
         separator.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(separator)
 
-        # Two boxes: what the buttons do was previously unlabelled, and Save sat
-        # directly under the measurement buttons with its Label field below it, so
-        # the field that names a reading appeared after the button that saves it.
-        measure_box = QGroupBox('Measurement')
-        measure_layout = QVBoxLayout(measure_box)
+        # The three things the OSpRad can be doing are one accordion: exactly
+        # one open at a time, so the controls on screen always belong to the mode
+        # in use, and the settings below can follow the open section instead of
+        # offering every mode's options to every mode.
+        measure_box, measure_layout = collapsible_group('Measurement', start_open=True)
         measure_header = QHBoxLayout()
         measure_header.addWidget(wrapped_label(
             'Point the OSpRad at what you want to measure, then choose a mode.'), 1)
@@ -454,7 +568,175 @@ class OSpRadApp(QMainWindow):
         tip(self.bt_irr, WHEEL_ROLE_HELP['I'])
         measure_layout.addWidget(self.bt_irr)
 
-        # Says what the hardware is doing while a measurement is in flight (see _measure).
+        layout.addWidget(measure_box)
+
+        # Both boxes below are collapsible: occasional features that would
+        # otherwise cost permanent vertical space on a phone. Folded by default.
+        live_box, live_layout = collapsible_group('Continuous mode')
+
+        live_tip = ('Measures over and over for as long as it is running, '
+                    'redrawing the plot after every update, so you can move the '
+                    'OSpRad around and watch the spectrum follow it. Nothing is '
+                    'saved to the history.\n\n'
+                    'Tick Irradiance and/or Radiance below to choose what is '
+                    'measured. With both ticked updates alternate, which is slower: '
+                    'the filter wheel has to travel between the two positions, '
+                    'where a single mode leaves it still.\n\n'
+                    'While it runs it borrows the measurement settings above: one '
+                    'scan per update, and (unless you have fixed an integration '
+                    'time yourself) an exposure it picks and holds. Your settings '
+                    'come back when it stops. Holding the exposure is what makes it '
+                    'fast. The firmware can only reuse its dark reference while the '
+                    'exposure stays put, so pointing at something much brighter or '
+                    'darker costs a couple of slow updates while it re exposes.\n\n'
+                    'Firmware 3.3.0 or newer is needed for any of that speed. '
+                    'Older firmware measures a fresh dark reference for every update.')
+        live_header = QHBoxLayout()
+        live_header.addWidget(wrapped_label(
+            'Measure continuously for a live plot. Nothing is saved.'), 1)
+        live_header.addWidget(help_button(live_tip))
+        live_layout.addLayout(live_header)
+
+        live_row = QHBoxLayout()
+        self.bt_continuous_start = QPushButton('Start')
+        self.bt_continuous_start.setEnabled(False)
+        self.bt_continuous_start.clicked.connect(self._start_continuous)
+        tip(self.bt_continuous_start, 'Start measuring continuously.')
+        live_row.addWidget(self.bt_continuous_start)
+        self.bt_continuous_stop = QPushButton('Stop')
+        self.bt_continuous_stop.setEnabled(False)
+        self.bt_continuous_stop.clicked.connect(lambda: self._stop_continuous())
+        tip(self.bt_continuous_stop, 'Stop after the update currently in flight. Use '
+                                     'Cancel above to abandon that one too.')
+        live_row.addWidget(self.bt_continuous_stop)
+        live_row.addStretch(1)
+        live_layout.addLayout(live_row)
+
+        self.continuous_status_label = QLabel('Not running.')
+        _set_role(self.continuous_status_label, 'muted')
+        live_layout.addWidget(self.continuous_status_label)
+
+        # Indented under the row above, matching the repeat box below.
+        live_modes = QHBoxLayout()
+        live_modes.setContentsMargins(20, 0, 0, 0)
+        live_measure_label = QLabel('Measure:')
+        _set_role(live_measure_label, 'muted')
+        live_measure_tip = ('Which reading each update takes. Tick both to alternate '
+                            'irradiance and radiance.')
+        live_modes.addWidget(captioned(live_measure_label, live_measure_tip))
+        self.continuous_irr_check = QCheckBox('Irradiance')
+        self.continuous_irr_check.setChecked(True)
+        tip(self.continuous_irr_check, 'Include an Irradiance reading in the live loop.')
+        live_modes.addWidget(self.continuous_irr_check)
+        self.continuous_rad_check = QCheckBox('Radiance')
+        tip(self.continuous_rad_check, 'Include a Radiance reading in the live loop.')
+        live_modes.addWidget(self.continuous_rad_check)
+        live_modes.addStretch(1)
+        live_layout.addLayout(live_modes)
+
+        hold_row = QHBoxLayout()
+        hold_row.setContentsMargins(20, 0, 0, 0)
+        hold_tip = (
+            'Stops the shutter wheel moving during a live run, at the cost of the '
+            'readings slowly going wrong. For demonstrating only.\n\n'
+            'What it turns off: the sensor reads a signal even in the dark, and '
+            'that offset is measured with the shutter closed and subtracted from '
+            'every reading. Normally OSpRad re measures it every %d seconds, '
+            'which is the one thing that still moves the wheel once a live run is '
+            'up to speed. Tick this and it measures the dark once, at the start '
+            'of the run, and keeps subtracting that one.\n\n'
+            'Why that goes wrong: the dark offset grows as the sensor warms up, '
+            'so an old one under subtracts and the whole spectrum reads gradually '
+            'too high. Drift is worst at long exposures and on a dim target, and '
+            'worse the longer the run goes on. Nothing on screen looks broken, '
+            'which is exactly why the numbers should not be quoted.\n\n'
+            'The exposure is held too. A dark reading is only good for the '
+            'exposure it was taken at, so re exposing means re measuring the '
+            'dark, which means moving the wheel. Point at something much '
+            'brighter and the spectrum clips flat; point at something much '
+            'darker and it sinks into the noise. Neither recovers on its own. '
+            'Untick this to let OSpRad re expose, at the price of the wheel '
+            'moving again.\n\n'
+            'Readings taken while the dark was being held cannot be saved to the '
+            'history. Untick this, or take a normal Radiance or Irradiance '
+            'measurement, for numbers worth keeping.'
+            % CONTINUOUS_DARK_REFRESH_SECONDS)
+        self.continuous_hold_dark_check = QCheckBox('Hold dark reference')
+        tip(self.continuous_hold_dark_check, hold_tip)
+        hold_row.addWidget(self.continuous_hold_dark_check)
+        hold_row.addWidget(help_button(hold_tip))
+        hold_row.addStretch(1)
+        live_layout.addLayout(hold_row)
+
+        layout.addWidget(live_box)
+
+        repeat_box, repeat_layout = collapsible_group('Automatic repeat')
+
+        repeat_tip = ('Takes a measurement automatically every N seconds and saves '
+                      'each one to the history under the label from the Save reading '
+                      'box, without asking again.\n\n'
+                      'Tick Irradiance and/or Radiance below to choose what is '
+                      'measured each time, then press Start. Readings all share the '
+                      'same label, so tell them apart by their timestamp in the '
+                      'History tab.')
+        repeat_header = QHBoxLayout()
+        repeat_header.addWidget(wrapped_label(
+            'Measure and save on a timer, unattended.'), 1)
+        repeat_header.addWidget(help_button(repeat_tip))
+        repeat_layout.addLayout(repeat_header)
+
+        repeat_row = QHBoxLayout()
+        repeat_row.addWidget(QLabel('Every (s)'))
+        self.repeat_time_edit = QLineEdit('300')
+        self.repeat_time_edit.setFixedWidth(60)
+        tip(self.repeat_time_edit, repeat_tip)
+        repeat_row.addWidget(self.repeat_time_edit)
+        self.bt_repeat_start = QPushButton('Start')
+        self.bt_repeat_start.setEnabled(False)
+        self.bt_repeat_start.clicked.connect(self._start_repeat)
+        tip(self.bt_repeat_start, 'Start automatically taking and saving measurements '
+                                  'on the interval set above.')
+        repeat_row.addWidget(self.bt_repeat_start)
+        self.bt_repeat_stop = QPushButton('Stop')
+        self.bt_repeat_stop.setEnabled(False)
+        self.bt_repeat_stop.clicked.connect(self._stop_repeat)
+        tip(self.bt_repeat_stop, 'Stop automatic repeat.')
+        repeat_row.addWidget(self.bt_repeat_stop)
+        repeat_row.addStretch(1)
+        repeat_layout.addLayout(repeat_row)
+
+        self.repeat_status_label = QLabel('Not running.')
+        _set_role(self.repeat_status_label, 'muted')
+        repeat_layout.addWidget(self.repeat_status_label)
+
+        # Indented under the row above; checkboxes only do anything while repeat runs.
+        repeat_modes = QHBoxLayout()
+        repeat_modes.setContentsMargins(20, 0, 0, 0)
+        measure_label = QLabel('Measure:')
+        _set_role(measure_label, 'muted')
+        measure_tip = ('Which reading(s) each automatic repeat takes. Tick both to '
+                       'record an Irradiance and a Radiance measurement every interval.')
+        repeat_modes.addWidget(captioned(measure_label, measure_tip))
+        self.repeat_irr_check = QCheckBox('Irradiance')
+        self.repeat_irr_check.setChecked(True)
+        tip(self.repeat_irr_check, 'Take an Irradiance reading on each automatic repeat.')
+        repeat_modes.addWidget(self.repeat_irr_check)
+        self.repeat_rad_check = QCheckBox('Radiance')
+        tip(self.repeat_rad_check, 'Take a Radiance reading on each automatic repeat.')
+        repeat_modes.addWidget(self.repeat_rad_check)
+        repeat_modes.addStretch(1)
+        repeat_layout.addLayout(repeat_modes)
+
+        layout.addWidget(repeat_box)
+
+        self._sections = {'measure': measure_box, 'continuous': live_box,
+                          'repeat': repeat_box}
+        for name, box in self._sections.items():
+            box.toggled.connect(
+                lambda checked, n=name: self._on_section_toggled(n, checked))
+
+        # Outside the accordion: a measurement started from any section reports here,
+        # and Cancel has to stay reachable whichever section is open.
         status_row = QHBoxLayout()
         self.measure_status_label = wrapped_label('')
         _set_role(self.measure_status_label, 'muted')
@@ -468,41 +750,13 @@ class OSpRadApp(QMainWindow):
         self._measure_status_row = (self.measure_status_label, self.bt_measure_cancel)
         for widget in self._measure_status_row:
             widget.setVisible(False)
-        measure_layout.addLayout(status_row)
-        layout.addWidget(measure_box)
+        layout.addLayout(status_row)
 
-        save_box = QGroupBox('Save reading')
-        save_layout = QVBoxLayout(save_box)
-        label_row = QHBoxLayout()
-        label_row.addWidget(QLabel('Label'))
-        label_row.addWidget(help_button(
-            'Names the reading in the History tab. Readings are not required to have '
-            'unique labels. If you reuse one, OSpRad asks whether to keep both or '
-            'replace the older reading.'))
-        label_row.addStretch(1)
-        save_layout.addLayout(label_row)
-        self.save_label_edit = QLineEdit()
-        # Typing a label clears a "needs a label" complaint without needing another press.
-        self.save_label_edit.textChanged.connect(lambda _: self._set_save_error(''))
-        save_layout.addWidget(self.save_label_edit)
-
-        self.bt_save = QPushButton('Save reading')
-        self.bt_save.setMinimumHeight(36)
-        self.bt_save.clicked.connect(self._on_save_clicked)
-        tip(self.bt_save, 'Save the current reading to the history, under the label above.')
-        save_layout.addWidget(self.bt_save)
-
-        # Inline rather than a dialog: a modal on a phone hides the very field it is
-        # complaining about, and this sits directly under the control that failed.
-        self.save_error_label = wrapped_label('')
-        _set_role(self.save_error_label, 'bad')
-        self.save_error_label.setVisible(False)
-        save_layout.addWidget(self.save_error_label)
-        layout.addWidget(save_box)
-
-        self._refresh_save_button()
-
-        settings = QGridLayout()
+        # Hidden while continuous mode is the open section: it takes these over for
+        # the duration of a run, so offering them there would only invite edits it
+        # is about to overwrite.
+        self._settings_box = QGroupBox('Measurement settings')
+        settings = QGridLayout(self._settings_box)
         settings.setColumnStretch(2, 1)
 
         int_time_label = QLabel('Integration time (ms)')
@@ -534,67 +788,48 @@ class OSpRadApp(QMainWindow):
         tip(self.max_scans_edit, scans_tip)
         settings.addWidget(captioned(scans_label, scans_tip), 1, 0)
         settings.addLayout(scans_row, 1, 1)
-        layout.addLayout(settings)
+        layout.addWidget(self._settings_box)
 
-        # Collapsible: an occasional feature that otherwise costs permanent vertical
-        # space on a phone. Folded by default.
-        repeat_box, repeat_layout = collapsible_group('Automatic repeat')
+        # One label field, two shapes. A single measurement is saved by hand, under
+        # exactly this label; automatic repeat saves every reading itself and only
+        # needs the label as a stem, so its Save button would have nothing to do.
+        self._save_box = QGroupBox('Save reading')
+        save_layout = QVBoxLayout(self._save_box)
+        label_row = QHBoxLayout()
+        label_row.addWidget(QLabel('Label'))
+        label_row.addWidget(help_button(
+            'Names the reading in the History tab. Readings are not required to have '
+            'unique labels. If you reuse one, OSpRad asks whether to keep both or '
+            'replace the older reading.\n\n'
+            'Under Automatic repeat the label is a stem rather than a name: every '
+            'reading the run saves gets a number after it, so they can be told apart '
+            'in the history.'))
+        label_row.addStretch(1)
+        save_layout.addLayout(label_row)
+        self.save_label_edit = QLineEdit()
+        # Typing a label clears a "needs a label" complaint without needing another press.
+        self.save_label_edit.textChanged.connect(lambda _: self._set_save_error(''))
+        save_layout.addWidget(self.save_label_edit)
 
-        repeat_tip = ('Takes a measurement automatically every N seconds and saves each '
-                      'one to the history under the label from the Save reading box, '
-                      'without asking again.\n\n'
-                      'Tick Irradiance and/or Radiance below to choose what is measured '
-                      'each time, then press Start. Readings all share the same label, '
-                      'so tell them apart by their timestamp in the History tab.')
-        repeat_header = QHBoxLayout()
-        repeat_header.addWidget(wrapped_label(
-            'Measure and save on a timer, unattended.'), 1)
-        repeat_header.addWidget(help_button(repeat_tip))
-        repeat_layout.addLayout(repeat_header)
+        self.save_hint_label = wrapped_label('')
+        _set_role(self.save_hint_label, 'muted')
+        save_layout.addWidget(self.save_hint_label)
 
-        repeat_row = QHBoxLayout()
-        repeat_row.addWidget(QLabel('Every (s)'))
-        self.repeat_time_edit = QLineEdit('300')
-        self.repeat_time_edit.setFixedWidth(60)
-        tip(self.repeat_time_edit, repeat_tip)
-        repeat_row.addWidget(self.repeat_time_edit)
-        self.bt_repeat_start = QPushButton('Start')
-        self.bt_repeat_start.setEnabled(False)
-        self.bt_repeat_start.clicked.connect(self._start_repeat)
-        tip(self.bt_repeat_start, 'Start automatically taking and saving measurements '
-                                  'on the interval set above.')
-        repeat_row.addWidget(self.bt_repeat_start)
-        self.bt_repeat_stop = QPushButton('Stop')
-        self.bt_repeat_stop.setEnabled(False)
-        self.bt_repeat_stop.clicked.connect(self._stop_repeat)
-        tip(self.bt_repeat_stop, 'Stop automatic repeat.')
-        repeat_row.addWidget(self.bt_repeat_stop)
-        repeat_row.addStretch(1)
-        repeat_layout.addLayout(repeat_row)
+        self.bt_save = QPushButton('Save reading')
+        self.bt_save.setMinimumHeight(36)
+        self.bt_save.clicked.connect(self._on_save_clicked)
+        tip(self.bt_save, 'Save the current reading to the history, under the label above.')
+        save_layout.addWidget(self.bt_save)
 
-        self.repeat_status_label = QLabel('Not running.')
-        _set_role(self.repeat_status_label, 'muted')
-        repeat_layout.addWidget(self.repeat_status_label)
+        # Inline rather than a dialog: a modal on a phone hides the very field it is
+        # complaining about, and this sits directly under the control that failed.
+        self.save_error_label = wrapped_label('')
+        _set_role(self.save_error_label, 'bad')
+        self.save_error_label.setVisible(False)
+        save_layout.addWidget(self.save_error_label)
+        layout.addWidget(self._save_box)
 
-        # Indented under the row above; checkboxes only do anything while repeat is running.
-        repeat_modes = QHBoxLayout()
-        repeat_modes.setContentsMargins(20, 0, 0, 0)
-        measure_label = QLabel('Measure:')
-        _set_role(measure_label, 'muted')
-        measure_tip = ('Which reading(s) each automatic repeat takes. Tick both to '
-                       'record an Irradiance and a Radiance measurement every interval.')
-        repeat_modes.addWidget(captioned(measure_label, measure_tip))
-        self.repeat_irr_check = QCheckBox('Irradiance')
-        self.repeat_irr_check.setChecked(True)
-        tip(self.repeat_irr_check, 'Take an Irradiance reading on each automatic repeat.')
-        repeat_modes.addWidget(self.repeat_irr_check)
-        self.repeat_rad_check = QCheckBox('Radiance')
-        tip(self.repeat_rad_check, 'Take a Radiance reading on each automatic repeat.')
-        repeat_modes.addWidget(self.repeat_rad_check)
-        repeat_modes.addStretch(1)
-        repeat_layout.addLayout(repeat_modes)
-
-        layout.addWidget(repeat_box)
+        self._refresh_save_button()
         layout.addWidget(self._build_analysis())
 
         self.cursor_label = QLabel('')
@@ -885,6 +1120,9 @@ class OSpRadApp(QMainWindow):
         self._log(status)
         self._update_conn_labels(status)
         self._update_sensor_status(config)
+        # A cancel reconnects to stop the scan; the wheel is wherever it was abandoned.
+        # Park it before anything else tries to take a measurement.
+        self._park_wheel()
 
     def _update_sensor_status(self, config):
         detected = config.sensor_detected
@@ -948,25 +1186,30 @@ class OSpRadApp(QMainWindow):
             return
         connected = self.connection is not None
         measuring = self._measure_worker is not None
-        idle = connected and not measuring
+        # Continuous mode is idle for the few ms between one update and the next.
+        # Counting it as busy stops every control below flickering once per update.
+        busy = measuring or self._continuous_running
+        idle = connected and not busy
 
         for button in (self.bt_rad, self.bt_irr, self.bt_motor_test):
             button.setEnabled(idle)
-        self.bt_connect.setEnabled(not measuring)
+        self.bt_connect.setEnabled(not busy)
+        self.bt_continuous_start.setEnabled(idle and not self._repeat_running)
         self.bt_repeat_start.setEnabled(idle and not self._repeat_running)
-        # Stop stays live so a repeat can be cancelled even mid measurement.
+        # Stop stays live so either loop can be cancelled even mid measurement.
+        self.bt_continuous_stop.setEnabled(self._continuous_running)
         self.bt_repeat_stop.setEnabled(self._repeat_running)
         self.bt_save.setEnabled(
-            self.reading is not None and not measuring and not self._reading_saved)
+            self.reading is not None and not busy and not self._reading_saved)
 
     def _check_connection_alive(self):
         """Notice an unplug while idle.
 
-        Deliberately does not talk to the device: an idle 'g' would inject traffic
-        into a port shared between the measurement worker and five GUI thread tabs,
-        would have to take the busy lock, and could desynchronise reply framing. An
-        unplug removes the port node, so plain enumeration answers the actual
-        question without any I/O to the unit.
+        Deliberately does not talk to the device. An idle 'g' would inject
+        traffic into a port shared between the measurement worker and five GUI
+        thread tabs, take the busy lock, and could desynchronise reply framing.
+        An unplug removes the port node, so plain enumeration answers the
+        actual question without any I/O to the unit.
         """
         if self.connection is None or self._measure_worker is not None or self._closing:
             return
@@ -1001,6 +1244,7 @@ class OSpRadApp(QMainWindow):
             self._stop_repeat()
             self._log('Automatic repeat stopped; the OSpRad was disconnected.',
                       level='error')
+        self._stop_continuous('the OSpRad was disconnected', level='error')
         self._propagate_connection()
         self._update_controls()
         self.setWindowTitle('OSpRad %s' % __version__)
@@ -1027,8 +1271,8 @@ class OSpRadApp(QMainWindow):
         Returns (int_time, n_min, n_max, push_time, push_scans) or raises ValueError.
         The old code did these int() calls mid measurement, where a ValueError
         escaped the except clause entirely and took the measurement down with a
-        traceback. The _prev_* cache is deliberately not updated here. That happens
-        only once the commands have actually landed, so a failed push can't poison it.
+        traceback. The _prev_* cache is not updated here. That happens only once
+        the commands have actually landed, so a failed push cannot poison it.
         """
         try:
             int_time = int(self.int_time_edit.text())
@@ -1047,14 +1291,16 @@ class OSpRadApp(QMainWindow):
         return (int_time, n_min, n_max,
                 int_time != self._prev_int_time, (n_min, n_max) != self._prev_scans)
 
-    def _measure(self, mode, on_done=None):
+    def _measure(self, mode, on_done=None, live=False):
         """Start a measurement on a background thread.
 
         on_done(ok) fires on the GUI thread when it finishes, however it finishes.
         That continuation is what lets repeat mode chain measurements instead of
-        blocking. Measuring used to run on the GUI thread, so the window froze for
-        the whole serial round trip (up to 90s x 3 retries on a dead unit) with no
-        way to show what it was doing.
+        blocking. Measuring used to run on the GUI thread, so the window froze
+        for the whole serial round trip with no way to show what it was doing.
+
+        live=True is continuous mode's fast path: the firmware reuses the dark
+        reference it already holds. serial_io drops it on firmware that predates it.
         """
         if self._measure_worker is not None:
             return  # already in flight; the buttons are greyed out
@@ -1070,11 +1316,16 @@ class OSpRadApp(QMainWindow):
             return
 
         self._measure_done = on_done
+        # Decided here rather than when the reading is published: whether a
+        # reading may be saved depends on how its measurement was taken, and by
+        # the time it lands the run it belonged to may already have been stopped.
+        self._measure_unsaveable = self._continuous_running and self._continuous_held_dark
         self._measure_cancelled = False
         self._measure_label = 'irradiance' if mode == 'i' else 'radiance'
         self._measure_started = time.time()
 
-        worker = Worker(self._do_measure, mode, self.connection, self.store, settings)
+        worker = Worker(self._do_measure, mode, self.connection, self.store, settings,
+                        live)
         worker.succeeded.connect(self._measure_succeeded)
         # Backstop: without it an unexpected exception would leave the buttons grey.
         worker.failed.connect(self._measure_crashed)
@@ -1086,13 +1337,13 @@ class OSpRadApp(QMainWindow):
         self._measure_tick.start()
         worker.start()
 
-    def _do_measure(self, mode, connection, store, settings):
+    def _do_measure(self, mode, connection, store, settings, live=False):
         """Background thread: hardware I/O plus the maths on its result.
 
         Returns an outcome rather than raising, because Worker.failed only carries
-        str(exc) and item 7 needs to tell a dead USB link from a calibration problem.
-        The flux/luminance/chromaticity work is 288 element pure Python looping run
-        three or four times per measurement, so it belongs off the GUI thread too.
+        str(exc) and item 7 needs to tell a dead USB link from a calibration
+        problem. The flux/luminance/chromaticity work is 288 element pure Python
+        looping, so it belongs off the GUI thread too.
         """
         int_time, n_min, n_max, push_time, push_scans = settings
         try:
@@ -1100,7 +1351,7 @@ class OSpRadApp(QMainWindow):
                 connection.set_integration_time(int_time)
             if push_scans:
                 connection.set_scan_range(n_min, n_max)
-            measurement = connection.measure(mode)
+            measurement = connection.measure(mode, live=live)
             calib = store.get(measurement.unit_number)
             flux = calib.to_flux(measurement.raw_counts, mode, measurement.int_time)
             luminance = calib.luminance(flux)
@@ -1161,12 +1412,19 @@ class OSpRadApp(QMainWindow):
         self.plot.add_curve('live', calib.wavelength, outcome.flux, mode=mode,
                             title=title, subtitle=subtitle, style='live')
         self._show_analysis(outcome)
+        # Demoted while continuous mode runs, which would otherwise push every
+        # other line out of the 500 line log within a minute.
         self._log('Unit #%d   saturated photosites: %s'
-                  % (measurement.unit_number, measurement.saturated))
+                  % (measurement.unit_number, measurement.saturated),
+                  level='debug' if self._continuous_running else 'info')
 
         self.measurement = measurement
         self.reading = datalog.format_measurement(mode, measurement, outcome.flux,
                                                   outcome.luminance, calib.wavelength)
+        if self._measure_unsaveable:
+            # Drawn and analysed like any other update, but not offered to Save:
+            # the dark under it is of unknown age (see "Hold dark reference" help).
+            self.reading = None
         self._last_luminance = outcome.luminance
         self._reading_saved = False
         self._finish_measure(True)
@@ -1180,13 +1438,14 @@ class OSpRadApp(QMainWindow):
 
         Cancelling is not just "ignore the result": the unit carries on scanning
         and will send its DATA line minutes later, which would be read as the reply
-        to whatever command came next. Reopening the port resets the Nano and aborts
-        the scan, so a reconnect is the resync, and it is quick next to the up to
-        7 minute measurement being abandoned.
+        to whatever command came next. Reopening the port resets the Nano and
+        aborts the scan, so a reconnect is the resync, and it is quick next to
+        the up to 7 minute measurement being abandoned.
         """
         if self._measure_worker is None or self._measure_cancelled:
             return
         self._measure_cancelled = True
+        self._park_pending = True
         self.bt_measure_cancel.setEnabled(False)
         self._measure_tick.stop()
         self._set_measure_status('Cancelling...')
@@ -1195,6 +1454,8 @@ class OSpRadApp(QMainWindow):
             # The chain's continuation is dropped below, so leaving repeat "running"
             # would strand it with nothing scheduled.
             self._stop_repeat()
+        # Same for continuous mode, whose next update is chained off this one.
+        self._stop_continuous('the update in flight was cancelled')
         if self.connection is not None:
             # Unblocks the worker's read; the reconnect below is what actually stops
             # the unit scanning.
@@ -1218,7 +1479,11 @@ class OSpRadApp(QMainWindow):
         """Single exit point for every path: success, device error, crash, cancel."""
         self._measure_worker = None
         self._measure_tick.stop()
-        self._set_measure_status('')
+        # Left standing between updates in continuous mode: clearing it hides
+        # the status row, so the layout jumped once per update and Cancel came
+        # and went.
+        if not self._continuous_running:
+            self._set_measure_status('')
         if self._measure_cancelled:
             self._measure_cancelled = False
             self._log('Measurement cancelled; reconnecting to stop the scan.')
@@ -1232,6 +1497,7 @@ class OSpRadApp(QMainWindow):
         # Cleared before the call: repeat mode starts the next measurement from
         # inside this callback, and that measurement's continuation must not be
         # overwritten.
+        self._park_wheel()
         callback = on_done if on_done is not None else self._measure_done
         self._measure_done = None
         if callback is not None:
@@ -1257,10 +1523,12 @@ class OSpRadApp(QMainWindow):
             label.setText('-')
 
     def _set_save_error(self, message, role='bad'):
-        """Inline complaint under the Save button; an empty message hides it."""
         self.save_error_label.setText(message)
         _set_role(self.save_error_label, role)
-        self.save_error_label.setVisible(bool(message))
+        # Automatic repeat has no Save button to complain about, and its
+        # readings are saved for it, so "no reading yet" would be noise there.
+        repeat = bool(self._sections) and self._sections['repeat'].isChecked()
+        self.save_error_label.setVisible(bool(message) and not repeat)
 
     def _refresh_save_button(self):
         """Save is only live once there is something to save. Rather than leave a dead
@@ -1524,8 +1792,278 @@ class OSpRadApp(QMainWindow):
             return
         self._log('Saved figure to %s' % path)
 
+    # Continuous mode is the same chain off the completion callback shape as
+    # repeat below, minus the timer and minus the save. It drives a live plot
+    # while the OSpRad is being pointed around, rather than recording anything.
+    def _start_continuous(self):
+        if self._continuous_running or self._repeat_running or self.connection is None:
+            return
+        if not (self.continuous_irr_check.isChecked()
+                or self.continuous_rad_check.isChecked()):
+            self._log('Tick Irradiance and/or Radiance under "Measure" before starting '
+                      'continuous mode.', level='error')
+            return
+        self._continuous_running = True
+        self._continuous_queue = []
+        self._continuous_frames = 0
+        self._continuous_slow_hinted = False
+        self._continuous_dark_time = None  # first update takes a fresh dark
+        self._continuous_held_dark = False
+        self._borrow_measure_settings()
+        # Force exposure and scan range to be re-sent on the first update even if
+        # they have not changed. The firmware drops its cached dark whenever they
+        # are set, which is what makes that first update take a fresh one. It must
+        # not inherit a dark left over from an earlier run.
+        self._prev_int_time = None
+        self._prev_scans = None
+        self._update_controls()
+        self.continuous_status_label.setText('Setting exposure...')
+        self._log('Continuous mode started.')
+        if not self.connection.supports_live_measure:
+            self._log('This unit\'s firmware measures a fresh dark reference for '
+                      'every update, so continuous mode refreshes every few seconds '
+                      'at best. Flashing %s brings the live update path.'
+                      % serial_io.FIRMWARE_HINT, level='warning')
+        QTimer.singleShot(0, self._continuous_step)
+
+    def _stop_continuous(self, reason=None, level='info'):
+        """Stop after the update in flight. That one is left to finish rather than
+        cancelled, because cancelling costs a reconnect (see _cancel_measure) and
+        the common case is a user who has seen enough, not one waiting on a stuck scan."""
+        if not self._continuous_running:
+            return
+        self._continuous_running = False
+        self._continuous_queue = []
+        if self._continuous_held_dark:
+            self._log('The dark reference was held for this run, so its readings '
+                      'cannot be saved. Take a Radiance or Irradiance measurement for '
+                      'one that can.', level='warning')
+        self._return_measure_settings()
+        self._park_pending = True
+        self._park_wheel()  # a no op while the last update is still in flight
+        self._update_controls()
+        self.continuous_status_label.setText('Not running.')
+        # _finish_measure leaves the measurement status standing while continuous
+        # mode runs; if nothing is in flight, this is what takes it back down.
+        if self._measure_worker is None:
+            self._set_measure_status('')
+        self._log('Continuous mode stopped%s.' % ('; ' + reason if reason else ''),
+                  level=level)
+
+    def _park_wheel(self):
+        """Leave the shutter closed once the link is free.
+
+        Every ordinary measurement already ends on the dark position, because its
+        last act is the block of dark scans. The two paths that do not are a live
+        update (which finishes on the light position so the next one can stay
+        there) and a measurement the user abandoned part way through. Both are
+        parked here rather than left with the sensor looking at the scene.
+        """
+        if not self._park_pending or self._measure_worker is not None:
+            return  # nothing to do, or the worker still owns the port
+        self._park_pending = False
+        if self.connection is None:
+            return
+        try:
+            self.connection.park_wheel()
+        except serial_io.SpecError as exc:
+            # Cosmetic: the next measurement moves the wheel wherever it needs it.
+            self._log('Could not park the shutter: %s' % exc, level='debug')
+
+    def _borrow_measure_settings(self):
+        """Take over the measurement settings for the run, and say so.
+
+        Written into the widgets rather than kept on the side, so what the hardware
+        is being told stays visible, and so _read_measure_settings picks them up
+        without a special case. _return_measure_settings puts them back.
+
+        Averaging is the first thing to go: the firmware asks for
+        floor(1000 / exposure) scans, capped by the box, so the shipped 3/50 turns
+        a 20ms exposure into 50 light scans and 50 dark ones. For a view you
+        are watching rather than recording, one scan is the point.
+        """
+        self._continuous_saved_settings = (self.int_time_edit.text(),
+                                           self.min_scans_edit.text(),
+                                           self.max_scans_edit.text())
+        self.min_scans_edit.setText('1')
+        self.max_scans_edit.setText('1')
+        # An exposure the user has fixed is theirs, and gets left alone. Auto (0)
+        # is the one setting continuous mode cannot live with, so it takes that over.
+        self._continuous_manages_exposure = self.int_time_edit.text().strip() == '0'
+        if self._continuous_manages_exposure:
+            self._log('Continuous mode is choosing the exposure and measuring one '
+                      'scan per update; your settings come back when it stops.')
+        else:
+            self._log('Continuous mode is measuring one scan per update at your fixed '
+                      '%s ms exposure; your settings come back when it stops.'
+                      % self.int_time_edit.text().strip())
+
+    def _return_measure_settings(self):
+        if self._continuous_saved_settings is None:
+            return
+        int_time, n_min, n_max = self._continuous_saved_settings
+        self.int_time_edit.setText(int_time)
+        self.min_scans_edit.setText(n_min)
+        self.max_scans_edit.setText(n_max)
+        self._continuous_saved_settings = None
+        self._continuous_manages_exposure = False
+
+    def _continuous_track_exposure(self):
+        """Keep the exposure roughly centred as the OSpRad is pointed around.
+
+        Cheaper and steadier than the firmware's own ramp, which starts from 1ms
+        and doubles: this starts from an exposure that was right a moment ago, so
+        it lands in one step. What it must not do is fidget. The firmware's dark
+        cache is keyed on the exposure, so every change costs a full measurement
+        with both wheel moves, hence a wide do nothing band rather than a nudge
+        per update.
+        """
+        measurement = self.measurement
+        if measurement is None or not self._continuous_manages_exposure:
+            return
+        peak = max(measurement.raw_counts) if measurement.raw_counts else 0.0
+        current = measurement.int_time
+
+        if self.continuous_hold_dark_check.isChecked():
+            # A dark is only valid for the exposure it was taken at. The
+            # firmware has no room for a second one, so re exposing means re
+            # measuring the dark, which means moving the wheel. So holding the
+            # dark has to hold the exposure too, or the box would not do what
+            # it says. The exposure this update ran at is adopted verbatim.
+            if self.int_time_edit.text().strip() == '0':
+                self.int_time_edit.setText(str(current))
+                self._log('Continuous mode fixed the exposure at %d ms and is '
+                          'holding it there, along with the dark reference, so the '
+                          'shutter wheel stays still.' % current)
+            return
+        # The box still says 0, so the firmware ramped for this exposure
+        # itself. Its answer is a good starting point, but it has to be
+        # written down: left on 0 the firmware would ramp again next update,
+        # and the ramp is what stops the dark reference from being reusable.
+        on_auto = self.int_time_edit.text().strip() == '0'
+
+        if measurement.saturated:
+            # The peak is clipped, so it understates how far over we are and
+            # the ratio below would barely move. Back off hard instead, and
+            # let the in band test stop it: two steps down beats four.
+            wanted = current * 0.25
+        elif CONTINUOUS_PEAK_LOW <= peak <= CONTINUOUS_PEAK_HIGH:
+            wanted = current  # good enough, and changing it would cost an update
+        elif peak > 0:
+            wanted = current * CONTINUOUS_TARGET_PEAK / peak
+        else:
+            wanted = current * CONTINUOUS_EXPOSURE_STEP  # nothing there at all
+        wanted = max(current / CONTINUOUS_EXPOSURE_STEP,
+                     min(current * CONTINUOUS_EXPOSURE_STEP, wanted))
+        new = int(round(max(CONTINUOUS_EXPOSURE_MIN,
+                            min(CONTINUOUS_EXPOSURE_MAX, wanted))))
+        if new == current and not on_auto:
+            return
+        self.int_time_edit.setText(str(new))
+        if on_auto:
+            self._log('Continuous mode fixed the exposure at %d ms. The next '
+                      'update takes a dark reference for it, then updates get fast.'
+                      % new)
+        else:
+            self._log('Continuous mode: exposure %d -> %d ms (peak %.0f counts%s).'
+                      % (current, new, peak,
+                         ', saturated' if measurement.saturated else ''),
+                      level='debug')
+
+    def _continuous_exposure_note(self):
+        """Warn when a held exposure has stopped fitting the scene.
+
+        Holding the dark holds the exposure (see _continuous_track_exposure), so
+        clipping and near darkness no longer correct themselves the way they do
+        the rest of the time. Nothing else on screen says so: a clipped spectrum
+        just looks like a flat topped one.
+        """
+        measurement = self.measurement
+        if measurement is None or not self.continuous_hold_dark_check.isChecked():
+            return ''
+        peak = max(measurement.raw_counts) if measurement.raw_counts else 0.0
+        if measurement.saturated:
+            trouble = 'Saturated'
+        elif peak < CONTINUOUS_PEAK_LOW:
+            trouble = 'Very dim'
+        else:
+            return ''
+        return ' %s; untick "Hold dark reference" to re expose.' % trouble
+
+    def _continuous_step(self):
+        if not self._continuous_running:
+            return  # a singleShot that outlived Stop is a harmless no op
+        if self.connection is None:
+            self._stop_continuous('the OSpRad was disconnected', level='error')
+            return
+        if not self._continuous_queue:
+            # Rebuilt every cycle, so ticking a mode mid run takes effect.
+            self._continuous_queue = [
+                mode for mode, check in (('i', self.continuous_irr_check),
+                                         ('r', self.continuous_rad_check))
+                if check.isChecked()]
+        if not self._continuous_queue:
+            self._stop_continuous('nothing is ticked under "Measure"', level='error')
+            return
+        # A full measurement re references the dark; every update in between
+        # reuses it. Without the periodic refresh the firmware would keep
+        # subtracting the dark it took when the run started, which is what
+        # "Hold dark reference" deliberately asks for, trading correct
+        # readings for a wheel that stays put.
+        now = time.time()
+        if self._continuous_dark_time is None:
+            # First update of the run. The settings pushed at start dropped the
+            # firmware's cached dark, so the next live update has to take a
+            # fresh one. The dark goes first, finishing on the light position
+            # with nothing left to move for the next call.
+            live = True
+            self._continuous_dark_time = now
+        elif now - self._continuous_dark_time < CONTINUOUS_DARK_REFRESH_SECONDS:
+            live = True
+        elif self.continuous_hold_dark_check.isChecked():
+            live = True
+            # Only now has a refresh been skipped, so only now are the
+            # readings suspect. Ticking and stopping inside the first interval
+            # leaves them as good as any other live update.
+            self._continuous_held_dark = True
+        else:
+            live = False
+        if not live:
+            self._continuous_dark_time = now
+        self._continuous_frame_started = now
+        self._measure(self._continuous_queue.pop(0),
+                      on_done=self._continuous_measure_done, live=live)
+
+    def _continuous_measure_done(self, ok):
+        if not self._continuous_running:
+            return  # Stop was pressed while that update was in flight
+        if not ok:
+            # The reason is already in the log. Looping on a unit that just
+            # failed would repeat the same failure (and the same error line)
+            # forever.
+            self._stop_continuous('the last update did not complete', level='warning')
+            return
+        self._continuous_frames += 1
+        elapsed = time.time() - self._continuous_frame_started
+        # Before the status line, so it reports the exposure the next update uses.
+        self._continuous_track_exposure()
+        exposure = self.int_time_edit.text().strip()
+        self.continuous_status_label.setText(
+            'Running: %d updates, %.1fs each, %s ms exposure.%s'
+            % (self._continuous_frames, elapsed, exposure, self._continuous_exposure_note()))
+        if (elapsed >= CONTINUOUS_SLOW_SECONDS and not self._continuous_slow_hinted
+                and not self._continuous_manages_exposure):
+            # Once per run, and only when the exposure is the user's own: when
+            # continuous mode picks it, a slow update means the light is genuinely
+            # dim and there is no advice to give.
+            self._continuous_slow_hinted = True
+            self._log('Continuous mode is updating every %.0fs at your fixed %s ms '
+                      'exposure. Clear the integration time to 0 to let continuous '
+                      'mode choose a faster one.' % (elapsed, exposure))
+        QTimer.singleShot(CONTINUOUS_GAP_MS, self._continuous_step)
+
     def _start_repeat(self):
-        if self._repeat_running or self.connection is None:
+        if self._repeat_running or self._continuous_running or self.connection is None:
             return
         if not self.repeat_irr_check.isChecked() and not self.repeat_rad_check.isChecked():
             self._log('Tick Irradiance and/or Radiance under "Measure" before starting '
@@ -1539,6 +2077,9 @@ class OSpRadApp(QMainWindow):
             return
         self._repeat_running = True
         self._repeat_interval_secs = max(1, int(self.repeat_time_edit.text()))
+        self._repeat_run += 1
+        self._repeat_round = 0
+        self._repeat_base = self.save_label_edit.text().strip() or 'auto'
         self._update_controls()
         self._countdown_timer.start()
         self._log('Automatic repeat started.')
@@ -1572,14 +2113,16 @@ class OSpRadApp(QMainWindow):
         self._repeat_interval_secs = value
         return value
 
-    # Repeat is a chain rather than a loop: each measurement now completes on a worker
-    # thread, so the next step has to be started from its completion callback.
+    # Repeat is a chain rather than a loop: each measurement now completes on a
+    # worker thread, so the next step has to be started from its completion callback.
     def _repeat_tick(self):
         if not self._repeat_running:
             return  # a singleShot that outlived Stop is a harmless no op
         self._repeat_queue = [mode for mode, check in (('i', self.repeat_irr_check),
                                                        ('r', self.repeat_rad_check))
                               if check.isChecked()]
+        self._repeat_both_modes = len(self._repeat_queue) > 1
+        self._repeat_round += 1
         self._repeat_step()
 
     def _repeat_step(self):
@@ -1593,13 +2136,30 @@ class OSpRadApp(QMainWindow):
         if not self._repeat_queue:
             self._schedule_next_tick()
             return
-        self._measure(self._repeat_queue.pop(0), on_done=self._repeat_measure_done)
+        self._repeat_mode = self._repeat_queue.pop(0)
+        self._measure(self._repeat_mode, on_done=self._repeat_measure_done)
+
+    def _repeat_label(self):
+        """Distinct label per repeat reading: every tick used to reuse the one
+        label from the box, so the whole run came back indistinguishable in the history.
+
+        "lamp" becomes lamp_1, lamp_2; with both modes ticked the mode is added
+        so a pair taken together can be told apart (lamp_i_1, lamp_r_1). An empty
+        box uses "auto". A second run in the same session carries its run number,
+        so it cannot collide with the first (lamp_2_1, lamp_2_i_1)."""
+        parts = [self._repeat_base]
+        if self._repeat_run > 1:
+            parts.append(str(self._repeat_run))
+        if self._repeat_both_modes:
+            parts.append(self._repeat_mode)
+        parts.append(str(self._repeat_round))
+        return '_'.join(parts)
 
     def _repeat_measure_done(self, ok):
         if not self._repeat_running:
             return  # Stop was pressed while that measurement was in flight
         if ok:
-            self._save(self.save_label_edit.text().strip())
+            self._save(self._repeat_label())
         self._repeat_step()
 
     def _schedule_next_tick(self):
@@ -1806,6 +2366,7 @@ class OSpRadApp(QMainWindow):
     def closeEvent(self, event):
         self._closing = True
         self._stop_repeat()
+        self._stop_continuous()
         self._countdown_timer.stop()
         self._measure_tick.stop()
         self._heartbeat_timer.stop()
