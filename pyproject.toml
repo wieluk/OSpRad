@@ -21,7 +21,7 @@ dependencies = [
 psychtoolbox = ["scipy"]
 
 [project.urls]
-Homepage = "https://github.com/troscianko/OSpRad"
+Homepage = "https://github.com/wieluk/OSpRad"
 
 [project.gui-scripts]
 osprad = "OSpRad:main"

@@ -40,8 +40,8 @@ def main():
 
     errors = []
     if app.split('.')[0] != firmware.split('.')[0]:
-        errors.append('app %s and firmware %s have different major versions. A 3.x app '
-                      'cannot talk to 2.x firmware.' % (app, firmware))
+        errors.append('app %s and firmware %s have different major versions. The app '
+                      'and firmware must share a major version.' % (app, firmware))
 
     for error in errors:
         print('ERROR: %s' % error, file=sys.stderr)

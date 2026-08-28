@@ -1,4 +1,4 @@
-# Run this file to launch the app. Requires OSpRad 3.x firmware on the Arduino Nano.
+# Run this file to launch the app. Requires OSpRad 1.x firmware on the Arduino Nano.
 
 import argparse
 import html
@@ -589,7 +589,7 @@ class OSpRadApp(QMainWindow):
                     'fast. The firmware can only reuse its dark reference while the '
                     'exposure stays put, so pointing at something much brighter or '
                     'darker costs a couple of slow updates while it re exposes.\n\n'
-                    'Firmware 3.3.0 or newer is needed for any of that speed. '
+                    'Firmware 1.0.0 or newer is needed for any of that speed. '
                     'Older firmware measures a fresh dark reference for every update.')
         live_header = QHBoxLayout()
         live_header.addWidget(wrapped_label(
@@ -1128,7 +1128,7 @@ class OSpRadApp(QMainWindow):
         detected = config.sensor_detected
         if detected is None:
             self.sensor_verdict_label.setText(
-                '? Optical sensor: not checked (needs firmware 3.2.0 or newer)')
+                '? Optical sensor: not checked (needs firmware 1.0.0 or newer)')
             _set_role(self.sensor_verdict_label, 'muted')
             self.sensor_detail_label.setText('')
             return

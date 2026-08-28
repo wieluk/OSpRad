@@ -11,7 +11,7 @@
 #include <EEPROM.h>
 Servo myservo;
 
-#define FIRMWARE_VERSION "3.3.0"
+#define FIRMWARE_VERSION "1.0.0"
 
 
 // EEPROM layout: each *_ADDR holds one int (2 bytes).
@@ -523,7 +523,7 @@ void loop(){
 
 
   // Newline terminated: parses one command per call instead of readString()'s old
-  // ~1s silence behaviour. See the 3.0.0 changelog.
+  // ~1s silence behaviour. See the 1.0.0 changelog.
   String arg = Serial.readStringUntil('\n');
   arg.trim();
 

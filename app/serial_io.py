@@ -1,4 +1,4 @@
-# Serial transport. Requires OSpRad firmware 3.x: newline terminated commands,
+# Serial transport. Requires OSpRad firmware 1.x: newline terminated commands,
 # framed OK/ERR/CFG/DATA/DIAG replies.
 
 import contextlib
@@ -36,14 +36,14 @@ MEASURE_TIMEOUT_MAX = 1800
 COMMAND_TIMEOUT = 90
 
 # Wire protocol is tied to the firmware's major version.
-REQUIRED_FIRMWARE_MAJOR = 3
+REQUIRED_FIRMWARE_MAJOR = 1
 FIRMWARE_HINT = 'firmware/OSpRad_firmware'
 
-# Firmware that added the live measure command ('l' + mode). It reuses the dark
+# Firmware that supports the live measure command ('l' + mode). It reuses the dark
 # reference from the previous measurement instead of moving the wheel to posDark
 # and re scanning it, which is what makes continuous mode refresh in fractions of
 # a second. Older firmware just measures normally.
-LIVE_MEASURE_FIRMWARE = (3, 3, 0)
+LIVE_MEASURE_FIRMWARE = (1, 0, 0)
 
 # Sensor self test verdict: roughness (spatial, adjacent pixels within one
 # scan) divided by repeat (temporal, the same pixel across two scans 150ms apart).
@@ -185,7 +185,7 @@ class UnitConfig:
 
     @property
     def sensor_detected(self):
-        """True/False, or None if the check couldn't run (firmware < 3.2.0 has no
+        """True/False, or None if the check couldn't run (a firmware without the
         'repeat' field). No verdict at all beats the false negative the old
         absolute roughness threshold gave on working units."""
         ratio = self.sensor_repeat_ratio
@@ -205,7 +205,7 @@ class Measurement:
 
 
 def _version_tuple(text):
-    """'3.3.0' -> (3, 3, 0). Unparseable text returns () so an unknown firmware is
+    """'1.0.0' -> (1, 0, 0). Unparseable text returns () so an unknown firmware is
     treated as the older one (compares below every real version)."""
     parts = []
     for piece in str(text).split('.'):
@@ -479,11 +479,12 @@ class SerialConnection:
         try:
             config = self._probe_config()
         except SpecProtocolError as exc:
-            # 1.x firmware has no config command at all, so it stays silent.
+            # An older firmware without the config command stays silent.
             raise SpecProtocolError(
                 "The OSpRad on %s did not respond to a configuration request (%s).\n\n"
-                "This usually means it is still running 1.x firmware. Flash %s onto the "
-                "Arduino Nano using the Arduino IDE, then reconnect."
+                "This usually means it is running an older firmware without the "
+                "configuration protocol. Flash %s onto the Arduino Nano using the "
+                "Arduino IDE, then reconnect."
                 % (self.port, exc, FIRMWARE_HINT)) from exc
 
         try:

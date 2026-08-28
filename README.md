@@ -13,7 +13,7 @@ Python app for Windows, macOS, Linux, and Android.
 ## Get the app
 
 Prebuilt binaries are attached to each
-[release](https://github.com/troscianko/OSpRad/releases):
+[release](https://github.com/wieluk/OSpRad/releases):
 
 | File | Platform |
 | --- | --- |
@@ -64,7 +64,7 @@ follow what you point at. Nothing is saved to history. While it runs it borrows
 the measurement settings: one scan per update, and an exposure it picks and
 holds unless you have fixed one yourself. Your settings come back when it stops.
 
-Holding the exposure is what makes it quick. Firmware 3.3.0 or newer refreshes
+Holding the exposure is what makes it quick. Firmware 1.0.0 or newer refreshes
 the plot in fractions of a second by reusing the dark reference between updates,
 but only while the exposure and scan count stay put, so an integration time left
 on 0 (auto) would re exposure ramp every update and undo it. Expect a couple of
@@ -88,10 +88,9 @@ sinks into the noise, and neither recovers until you untick the box. Readings
 taken while the dark was held cannot be saved to the history.
 
 The app and firmware are released together and must share a major version
-(currently 3.x). A 3.x app cannot talk to 1.x or 2.x firmware. If connecting
-reports an unexpected reply, reflash. `data.csv` files written by 1.x are not
-readable; the column layout changed when the firmware gained the framed reply
-protocol.
+(currently 1.x). If connecting reports an unexpected reply, reflash. `data.csv`
+files written by the original upstream 1.x app are not readable; the column
+layout changed when the firmware gained the framed reply protocol.
 
 ## Build one
 
