@@ -195,5 +195,14 @@ OSpRad is free software under the GNU General Public License v3.0 (see `LICENSE`
 and comes with no warranty of any kind.
 
 Original OSpRad by Jolyon Troscianko, 2022
-([troscianko/OSpRad](https://github.com/troscianko/OSpRad)). This repository is a
-fork that has since been heavily modified (2026).
+([troscianko/OSpRad](https://github.com/troscianko/OSpRad)). This repository
+started as a fork and has since been heavily modified (2026); it is now
+maintained as a standalone project.
+
+## Citation
+
+If you use OSpRad in published work, please cite the original release:
+
+Troscianko, J. (2023) OSpRad: an open-source, low-cost, high-sensitivity
+spectroradiometer. *Journal of Experimental Biology*.
+<https://doi.org/10.1242/jeb.245416>
