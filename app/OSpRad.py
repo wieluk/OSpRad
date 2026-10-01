@@ -56,7 +56,15 @@ def _user_data_dir():
 if getattr(sys, 'frozen', False):
     # __file__ points inside the PyInstaller bundle, which onefile deletes on exit.
     _exe_dir = os.path.dirname(sys.executable)
-    BASE_DIR = _exe_dir if os.access(_exe_dir, os.W_OK) else _user_data_dir()
+    if sys.platform == 'darwin':
+        # Not inside the .app, which an update replaces and Gatekeeper may run read only.
+        BASE_DIR = _user_data_dir()
+        for _name in ('calibration_data.csv', 'data.csv'):
+            if (os.path.exists(os.path.join(_exe_dir, _name))
+                    and not os.path.exists(os.path.join(BASE_DIR, _name))):
+                shutil.copy2(os.path.join(_exe_dir, _name), BASE_DIR)
+    else:
+        BASE_DIR = _exe_dir if os.access(_exe_dir, os.W_OK) else _user_data_dir()
 else:
     _source_dir = os.path.dirname(os.path.abspath(__file__))
     if os.path.exists(os.path.join(_source_dir, 'calibration_data.csv')):
@@ -867,23 +875,23 @@ class OSpRadApp(QMainWindow):
             'peak': 'Wavelength of the highest intensity. Daylight/white LEDs peak '
                     'around 450 to 550nm; incandescent bulbs peak further into the '
                     'red, often >600nm.',
-            'fwhm': 'Width of the main peak at half height. A few nm = single LED/'
-                    'laser line; broad or "n/a" = broadband source like daylight or '
-                    'an incandescent bulb.',
+            'fwhm': 'Width of the main peak at half height. Never below the sensor\'s '
+                    '~10nm resolution, so a laser line reads ~10nm; broad or "n/a" = '
+                    'broadband source like daylight or an incandescent bulb.',
             'cie_x': 'CIE 1931 chromaticity x (perceived colour, brightness '
                      'independent). Daylight ~ (0.31, 0.33); warm incandescent ~ '
                      '(0.45, 0.41).',
             'cie_y': 'CIE 1931 chromaticity y. Read together with CIE x: the pair '
                      'gives the perceived colour independently of brightness. '
                      'Daylight ~ (0.31, 0.33); warm incandescent ~ (0.45, 0.41).',
-            'cct': 'Approximate "warmth" in Kelvin. ~2700K = warm/orange '
-                   '(incandescent); ~5000 to 6500K = cool/blue (daylight). Shows "-" '
-                   'for narrow band light, where CCT is meaningless.',
+            'cct': '"Warmth" in Kelvin. ~2700K = warm/orange (incandescent); ~5000 '
+                   'to 6500K = cool/blue (daylight). Duv is the distance from the '
+                   'blackbody line; shows "-" beyond \u00b10.05, where CCT is undefined.',
         }
 
         self._analysis_labels = {}
         fields = (('peak', 'Peak λ'), ('fwhm', 'FWHM'),
-                  ('cie_x', 'CIE x'), ('cie_y', 'CIE y'), ('cct', 'CCT (approx.)'))
+                  ('cie_x', 'CIE x'), ('cie_y', 'CIE y'), ('cct', 'CCT'))
         for i, (key, caption) in enumerate(fields):
             row, col = divmod(i, 2)
             caption_label = QLabel(caption + ':')
@@ -1282,7 +1290,7 @@ class OSpRadApp(QMainWindow):
         if int_time < 0:
             raise ValueError('integration time cannot be negative')
         try:
-            n_min = max(1, int(self.min_scans_edit.text()))
+            n_min = min(50, max(1, int(self.min_scans_edit.text())))
             n_max = min(50, int(self.max_scans_edit.text()))
         except ValueError as exc:
             raise ValueError('scan counts must be whole numbers') from exc
@@ -1353,7 +1361,8 @@ class OSpRadApp(QMainWindow):
                 connection.set_scan_range(n_min, n_max)
             measurement = connection.measure(mode, live=live)
             calib = store.get(measurement.unit_number)
-            flux = calib.to_flux(measurement.raw_counts, mode, measurement.int_time)
+            flux = calib.to_flux(measurement.raw_counts, mode, measurement.int_time,
+                                 measurement.vcc)
             luminance = calib.luminance(flux)
             peak = analysis.peak_wavelength(calib.wavelength, flux)
             fwhm = analysis.fwhm(calib.wavelength, flux)
@@ -1414,8 +1423,9 @@ class OSpRadApp(QMainWindow):
         self._show_analysis(outcome)
         # Demoted while continuous mode runs, which would otherwise push every
         # other line out of the 500 line log within a minute.
-        self._log('Unit #%d   saturated photosites: %s'
-                  % (measurement.unit_number, measurement.saturated),
+        self._log('Unit #%d   saturated photosites: %s%s'
+                  % (measurement.unit_number, measurement.saturated,
+                     '   supply %d mV' % measurement.vcc if measurement.vcc else ''),
                   level='debug' if self._continuous_running else 'info')
 
         self.measurement = measurement
@@ -1513,7 +1523,8 @@ class OSpRadApp(QMainWindow):
             self._analysis_labels['cie_x'].setText('%.4f' % x)
             self._analysis_labels['cie_y'].setText('%.4f' % y)
             cct = calibration.cct_from_xy(x, y)
-            self._analysis_labels['cct'].setText(('%d K' % round(cct)) if cct else '-')
+            self._analysis_labels['cct'].setText(('%d K (Duv %+.4f)' % (round(cct[0]), cct[1]))
+                                                 if cct else '-')
         else:
             for key in ('cie_x', 'cie_y', 'cct'):
                 self._analysis_labels[key].setText('-')
@@ -1645,9 +1656,11 @@ class OSpRadApp(QMainWindow):
     def _add_to_comparison(self, offset):
         try:
             reading = datalog.load_reading(DATA_FILE, offset)
-            calib = self.store.get(reading.unit_number)
-            calib._derive()  # .wavelength is normally derived as a side effect of
-                              # to_flux()/luminance(); this reload path triggers neither.
+            wavelength = reading.wavelength
+            if wavelength is None:  # no header row in the file
+                calib = self.store.get(reading.unit_number)
+                calib._derive()
+                wavelength = calib.wavelength
         except (OSError, ValueError, calibration.CalibrationError) as exc:
             self._log(str(exc), level='error')
             return
@@ -1656,7 +1669,7 @@ class OSpRadApp(QMainWindow):
         # SpectrumPlot._redraw), so tag each curve's mode in its legend. Radiance
         # and irradiance are different physical units.
         mode_tag = 'radiance' if reading.mode == 'r' else 'irradiance'
-        self.history_plot.add_curve(offset, calib.wavelength, reading.flux, mode=reading.mode,
+        self.history_plot.add_curve(offset, wavelength, reading.flux, mode=reading.mode,
                                     style='overlay', label='%s [%s]' % (label_text, mode_tag))
         self._compared_offsets.add(offset)
         self._log('Comparing reading "%s" (unit #%d)' % (label_text, reading.unit_number))

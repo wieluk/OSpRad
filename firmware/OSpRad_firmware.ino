@@ -11,7 +11,7 @@
 #include <EEPROM.h>
 Servo myservo;
 
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "1.1.0"
 
 
 // EEPROM layout: each *_ADDR holds one int (2 bytes).
@@ -76,13 +76,17 @@ int satSum = 0;
 int maxVal = 0;
 int prevMaxVal = 0;
 
-int nScansMax = 50; // 65535 is the max uint16 data value, so can only deal with about 60 max
+#define NSCANS_LIMIT 64 // data[][] is uint16_t: 64 x 1023 is the most scans that fit
+int nScansMax = 50;
 int nScansMin = 3;
 long sampleTimeMax = 1000; // target sampling time for repeat scans
 int nScans = 1;
 int measureType = 0;
 
 uint16_t lineChecksum = 0; // running checksum for the current DATA line
+
+// The sensor integrates for ST high + 48 CLK (datasheet); this is those 48 CLK in us.
+unsigned long integrationTailUs = 0;
 
 
 void loadConfig(){
@@ -179,6 +183,22 @@ void csPrintFloat2(float v){
 }
 
 
+// Supply voltage (mV), the ADC's reference, from the internal 1.1V bandgap.
+long readVccMilliVolts(){
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  delay(2); // bandgap settling
+  long sum = 0;
+  for(int i = 0; i < 36; i++){
+    ADCSRA |= _BV(ADSC);
+    while(bit_is_set(ADCSRA, ADSC));
+    if(i >= 4) // the first conversions after a mux switch are off
+      sum += ADC;
+  }
+  analogRead(VIDEOpin); // settle the mux back on the sensor
+  return (1100L * 1023L * 32L) / sum;
+}
+
+
 void setup(){
   loadConfig();
 
@@ -193,8 +213,20 @@ void setup(){
   // malformed or incomplete command. Keep it short so that fails fast.
   Serial.setTimeout(200);
   while (! Serial);
+  // Timed over 480 pulses since micros() only resolves 4us.
+  unsigned long t0 = micros();
+  for(int i = 0; i < 480; i++)
+    clockPulse();
+  integrationTailUs = (micros() - t0) / 10;
   readSpectrometer();
   resetData();
+}
+
+void clockPulse(){
+  digitalWrite(CLKpin, HIGH);
+  delayMicroseconds(delayTime);
+  digitalWrite(CLKpin, LOW);
+  delayMicroseconds(delayTime);
 }
 
 void readSpectrometer(){
@@ -206,32 +238,20 @@ void readSpectrometer(){
   delayMicroseconds(delayTime);
   digitalWrite(CLKpin, LOW);
   digitalWrite(STpin, HIGH);
-  delayMicroseconds(delayTime);
 
-  unsigned long cTime = millis(); // start time
-  unsigned long eTime = cTime + intTime; // end time
-
-  //Sample for a period of time
- while(cTime < eTime){
-      digitalWrite(CLKpin, HIGH);
-      delayMicroseconds(delayTime);
-      digitalWrite(CLKpin, LOW);
-      delayMicroseconds(delayTime);
-      cTime=millis();
-  }
+  // micros(), as millis() ticks lose a random 0 to 1ms per exposure; subtraction survives wrap.
+  unsigned long stHighUs = (unsigned long) intTime * 1000UL;
+  stHighUs = (stHighUs > integrationTailUs) ? stHighUs - integrationTailUs : 0;
+  unsigned long start = micros();
+  while(micros() - start < stHighUs)
+      clockPulse();
 
   //Set STpin to low
   digitalWrite(STpin, LOW);
 
   //Sample for a period of time
-  for(int i = 0; i < 88; i++){ //87 aligns correctly
-
-      digitalWrite(CLKpin, HIGH);
-      delayMicroseconds(delayTime);
-      digitalWrite(CLKpin, LOW);
-      delayMicroseconds(delayTime);
-
-  }
+  for(int i = 0; i < 88; i++) //87 aligns correctly
+      clockPulse();
 
   int specRead = 0;
   satN = 0;
@@ -417,6 +437,8 @@ void takeMeasurement(int type, bool live){
           float tInt = floor(float(prevIntTime*0.9*satVal)/float(prevMaxVal));
           if(tInt > maxIntTime)
               intTime = maxIntTime;
+          else if(tInt < 1) // a 1ms scan near saturation floors to 0
+              intTime = 1;
           else intTime = tInt;
         }
 
@@ -549,7 +571,7 @@ void loop(){
       if(v <= 0){
         Serial.println(F("ERR,bad_scan_count"));
       } else {
-        nScansMax = v;
+        nScansMax = min(v, NSCANS_LIMIT);
         if(nScansMax < nScansMin)
           nScansMin = nScansMax;
         darkValid = false; // the held dark belonged to the old settings
@@ -564,7 +586,7 @@ void loop(){
       if(v <= 0){
         Serial.println(F("ERR,bad_scan_count"));
       } else {
-        nScansMin = v;
+        nScansMin = min(v, NSCANS_LIMIT);
         if(nScansMin > nScansMax)
           nScansMax = nScansMin;
         darkValid = false; // the held dark belonged to the old settings
@@ -615,6 +637,10 @@ void loop(){
       Serial.print(F(",max:")); Serial.print(rawMax);
       Serial.print(F(",roughness:")); Serial.print(roughness, 2);
       Serial.print(F(",repeat:")); Serial.println(repeat, 2);
+
+    } else if(arg.startsWith("v") == true){
+      Serial.print(F("OK,vcc,"));
+      Serial.println(readVccMilliVolts());
 
     } else if(arg.startsWith("w") == true){
         arg.replace("w", "");

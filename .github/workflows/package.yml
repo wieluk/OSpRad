@@ -265,7 +265,13 @@ jobs:
     name: macOS
     needs: prepare
     if: inputs.macos || github.ref_type == 'tag'
-    runs-on: macos-latest
+    # PyInstaller only builds for the host architecture.
+    strategy:
+      matrix:
+        include:
+          - { runner: macos-latest, arch: arm64 }
+          - { runner: macos-15-intel, arch: x86_64 }
+    runs-on: ${{ matrix.runner }}
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -286,11 +292,11 @@ jobs:
         run: |
           mkdir -p dist
           ditto -c -k --keepParent packaging/macos/dist/OSpRad.app \
-            "dist/OSpRad-${VERSION}-macos.zip"
+            "dist/OSpRad-${VERSION}-macos-${{ matrix.arch }}.zip"
 
       - uses: actions/upload-artifact@v7.0.1
         with:
-          name: OSpRad-macos
+          name: OSpRad-macos-${{ matrix.arch }}
           path: dist/*
           if-no-files-found: error
 

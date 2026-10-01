@@ -27,6 +27,9 @@ FIELD_LABELS = {
     WHEEL_FIELD: 'Shutter wheel positions',
 }
 
+# Each sensitivity carries the supply voltage it was measured at ('<key>Vcc', mV).
+SENS_MODES = {'radSens': 'r', 'irrSens': 'i'}
+
 WHEEL_ROLES = ('dark', 'irr', 'rad')
 # Export keys -> the single letter role the firmware uses
 # (serial_io.save_wheel_position).
@@ -76,6 +79,9 @@ def build_export(calib, config=None, fields=None):
     for key in CSV_FIELDS:
         if key in fields:
             data[key] = [float(v) for v in source[key]]
+    for key, mode in SENS_MODES.items():
+        if key in fields and calib.vcc_ref[mode]:
+            data[key + 'Vcc'] = calib.vcc_ref[mode]
     if WHEEL_FIELD in fields and config is not None:
         data[WHEEL_FIELD] = {'dark': config.dark, 'irr': config.irr, 'rad': config.rad}
     return data
@@ -130,6 +136,10 @@ def loads(text, source='the file'):
         except (TypeError, ValueError) as exc:
             raise CalibrationIOError(
                 'Calibration file\'s "%s" contains non numeric values.' % key) from exc
+
+    for key in SENS_MODES:
+        if key in values and isinstance(data.get(key + 'Vcc'), (int, float)):
+            values[key + 'Vcc'] = float(data[key + 'Vcc'])
 
     wheel = data.get(WHEEL_FIELD)
     if wheel is not None:
@@ -188,7 +198,9 @@ def merge(store, imported, fields):
         pick('wavCoef', 'wav_coef'),
         pick('radSens', 'rad_sens'),
         pick('irrSens', 'irr_sens'),
-        pick('linCoefs', 'lin_coefs'))
+        pick('linCoefs', 'lin_coefs'),
+        {mode: imported.values.get(key + 'Vcc') if key in selected
+         else existing and existing.vcc_ref[mode] for key, mode in SENS_MODES.items()})
 
 
 def apply_wheel_positions(connection, wheel):

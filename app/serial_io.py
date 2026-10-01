@@ -45,6 +45,9 @@ FIRMWARE_HINT = 'firmware/OSpRad_firmware'
 # a second. Older firmware just measures normally.
 LIVE_MEASURE_FIRMWARE = (1, 0, 0)
 
+# Firmware that reports its supply voltage ('v'), the ADC's reference.
+VCC_FIRMWARE = (1, 1, 0)
+
 # Sensor self test verdict: roughness (spatial, adjacent pixels within one
 # scan) divided by repeat (temporal, the same pixel across two scans 150ms apart).
 #
@@ -202,6 +205,7 @@ class Measurement:
         self.int_time = int_time
         self.saturated = saturated
         self.raw_counts = raw_counts
+        self.vcc = None  # supply voltage (mV), if the firmware reports it
 
 
 def _version_tuple(text):
@@ -391,7 +395,7 @@ class SerialConnection:
                 continue
             if line.startswith("ERR,"):
                 raise SpecCommandError(line[4:])
-            if not line.startswith(expect + ","):
+            if line != expect and not line.startswith(expect + ","):
                 raise SpecProtocolError(
                     "Expected a %s reply but got: %r. Check the OSpRad is running "
                     "%d.x firmware." % (expect, line[:60], REQUIRED_FIRMWARE_MAJOR))
@@ -545,7 +549,13 @@ class SerialConnection:
         """
         command = ('l' + mode) if (live and self.supports_live_measure) else mode
         with self._busy('measure %r' % command):
-            return self._measure_locked(command, retries)
+            measurement = self._measure_locked(command, retries)
+            if self.firmware_version >= VCC_FIRMWARE:
+                try:
+                    measurement.vcc = int(self._command_locked("v", "OK,vcc").split(',')[2])
+                except (SpecError, IndexError, ValueError) as exc:
+                    log.warning('Could not read supply voltage: %s', exc)
+            return measurement
 
     def _measure_locked(self, command, retries=2):
         original_timeout = self._ser.timeout

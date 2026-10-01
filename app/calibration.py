@@ -5,37 +5,59 @@ import math
 import os
 import tempfile
 
+import numpy as np
+
+import cie_cmf
+
 log = logging.getLogger('osprad.calibration')
 
 PIXELS = 288
 CSV_COLUMNS = 290  # calibration_data.csv is a fixed width spreadsheet export
 
-# CIE 1931 2 degree color matching functions (Wyman, Sloan & Shirley, 2013), as a
-# piecewise Gaussian fit. Each entry is one lobe:
-# (amplitude, mu, sigma_below, sigma_above).
-CIE_X_COEFS = [(1.056, 599.8, 37.9, 31.0), (0.362, 442.0, 16.0, 26.7), (-0.065, 501.1, 20.4, 26.2)]
-CIE_Y_COEFS = [(0.821, 568.8, 46.9, 40.5), (0.286, 530.9, 16.3, 31.1)]
-CIE_Z_COEFS = [(1.217, 437.0, 11.8, 36.0), (0.681, 459.0, 26.0, 13.8)]
+_CMF_NM = cie_cmf.START_NM + np.arange(len(cie_cmf.XYZ))
+_CMF = np.asarray(cie_cmf.XYZ)
 
 
-def _piecewise_gaussian(w, lobes):
-    total = 0.0
-    for amp, mu, sigma_lo, sigma_hi in lobes:
-        sigma = sigma_lo if w < mu else sigma_hi
-        total += amp * math.exp(-0.5 * (w - mu) ** 2 / sigma ** 2)
-    return total
+def cmf(wavelength):
+    """CIE 1931 2 degree (xbar, ybar, zbar) at the given wavelengths (nm)."""
+    return tuple(np.interp(wavelength, _CMF_NM, _CMF[:, k], left=0.0, right=0.0)
+                 for k in range(3))
+
+
+def _planck_uv(temps):
+    """CIE 1960 (u, v) of blackbodies at temps (K)."""
+    lam = _CMF_NM * 1e-9
+    with np.errstate(over='ignore'):
+        spd = 1.0 / (lam ** 5 * np.expm1(1.4388e-2 / (lam * np.asarray(temps)[:, None])))
+    X, Y, Z = (spd @ _CMF).T
+    d = X + 15 * Y + 3 * Z
+    return 4 * X / d, 6 * Y / d
+
+
+_LOCUS_T = np.geomspace(1000, 100000, 4607)  # 0.1% steps
+_LOCUS_UV = None
 
 
 def cct_from_xy(x, y):
-    """Correlated color temperature (Kelvin) from CIE xy via McCamy's cubic
-    approximation. Meaningful only near the Planckian locus (~2000 to 20000K). The
-    UI labels it "CCT (approx.)" because the number is valid but meaningless for
-    saturated/narrowband spectra. Returns None if y == 0.1858 (degenerate)."""
-    denom = 0.1858 - y
-    if abs(denom) < 1e-9:
+    """(CCT in K, Duv) from CIE xy, or None where CIE 15 leaves CCT undefined (|Duv| > 0.05)."""
+    global _LOCUS_UV
+    if _LOCUS_UV is None:
+        _LOCUS_UV = _planck_uv(_LOCUS_T)
+    d = -2 * x + 12 * y + 3
+    u, v = 4 * x / d, 6 * y / d
+    dist = np.hypot(_LOCUS_UV[0] - u, _LOCUS_UV[1] - v)
+    i = int(np.argmin(dist))
+    if i == 0 or i == len(_LOCUS_T) - 1:
         return None
-    n = (x - 0.3320) / denom
-    return -449.0 * n ** 3 + 3525.0 * n ** 2 - 6823.3 * n + 5520.33
+    # Parabola through the three nearest grid points, in log temperature.
+    d0, d1, d2 = dist[i - 1:i + 2]
+    offset = 0.5 * (d0 - d2) / (d0 - 2 * d1 + d2)
+    cct = float(_LOCUS_T[i] * (_LOCUS_T[i + 1] / _LOCUS_T[i]) ** offset)
+    pu, pv = (c[0] for c in _planck_uv([cct]))
+    duv = math.copysign(math.hypot(pu - u, pv - v), v - pv)
+    if abs(duv) > 0.05:
+        return None
+    return cct, duv
 
 ROW_LENGTHS = {
     'wavCoef': 6,
@@ -44,28 +66,31 @@ ROW_LENGTHS = {
     'linCoefs': 2,
 }
 
+# Optional supply voltage (mV) the radiance and irradiance sensitivities were measured at.
+VCC_ROW = 'vccRef'
+
 
 class CalibrationError(Exception):
     pass
 
 
 def linearize(count, lin_coefs):
-    """Raw ADC count to linear flux, per the OSpRad linearisation model."""
+    """Raw ADC count to linear flux, per the OSpRad linearisation model. Odd in count,
+    so dark subtracted noise below zero stays negative instead of biasing upwards."""
     a, b = float(lin_coefs[0]), float(lin_coefs[1])
-    if count > 0:
-        multiplier = a * math.log((count + 1) * b)
-    else:
-        multiplier = -1 * a * math.log((-count + 1) * b)
-    return count / multiplier
+    if count == 0:
+        return 0.0
+    return count / (a * math.log((abs(count) + 1) * b))
 
 
 class CalibrationSet:
-    def __init__(self, unit_number, wav_coef, rad_sens, irr_sens, lin_coefs):
+    def __init__(self, unit_number, wav_coef, rad_sens, irr_sens, lin_coefs, vcc_ref=None):
         self.unit_number = unit_number
         self.wav_coef = wav_coef
         self.rad_sens = rad_sens
         self.irr_sens = irr_sens
         self.lin_coefs = lin_coefs
+        self.vcc_ref = dict({'r': None, 'i': None}, **(vcc_ref or {}))
         # True only for units still carrying the calibration the app ships with; see
         # CalibrationStore.load.
         self.is_default = False
@@ -76,26 +101,30 @@ class CalibrationSet:
             return
         c = self.wav_coef
         self.wavelength = [sum(c[k] * i ** k for k in range(6)) for i in range(PIXELS)]
-        self.ciex = [_piecewise_gaussian(w, CIE_X_COEFS) for w in self.wavelength]
-        self.ciey = [_piecewise_gaussian(w, CIE_Y_COEFS) for w in self.wavelength]
-        self.ciez = [_piecewise_gaussian(w, CIE_Z_COEFS) for w in self.wavelength]
+        self.ciex, self.ciey, self.ciez = (list(c) for c in cmf(self.wavelength))
 
-        self.wavelength_bins = [self.wavelength[i + 1] - self.wavelength[i]
-                                for i in range(PIXELS - 1)]
-        self.wavelength_bins.append(self.wavelength[PIXELS - 1] - self.wavelength[PIXELS - 2])
+        # Central differences, so each bin is centred on its photosite.
+        self.wavelength_bins = list(np.gradient(self.wavelength))
         self._derived = True
 
     def sensitivity(self, mode):
         return self.irr_sens if mode == 'i' else self.rad_sens
 
-    def to_flux(self, raw_counts, mode, int_time):
+    def supply_factor(self, vcc, mode):
+        """Rescales counts read at supply vcc (mV) to the calibration's supply, since
+        the ADC measures against Vcc; 1.0 if either is unknown."""
+        ref = self.vcc_ref.get(mode)
+        return vcc / ref if vcc and ref else 1.0
+
+    def to_flux(self, raw_counts, mode, int_time, vcc=None):
         """Raw counts to W/(sqm*nm) (irradiance) or W/(sr*sqm*nm) (radiance)."""
         self._derive()
         sens = self.sensitivity(mode)
+        factor = self.supply_factor(vcc, mode)
         flux = [0.0] * PIXELS
         for i in range(0, PIXELS):
             if sens[i] > 0:
-                flux[i] = (linearize(raw_counts[i], self.lin_coefs)
+                flux[i] = (linearize(raw_counts[i] * factor, self.lin_coefs)
                            / (sens[i] * int_time * self.wavelength_bins[i]))
         return flux
 
@@ -190,9 +219,15 @@ class CalibrationStore:
                     values[row_type] = [float(v) for v in raw]
                 except ValueError:
                     problems.append("Unit %d: '%s' contains non numeric values." % (unit, row_type))
+            try:
+                vcc = [float(v or 0) or None for v in by_type.get(VCC_ROW, [])]
+            except ValueError:
+                vcc = []
+                problems.append("Unit %d: '%s' contains non numeric values." % (unit, VCC_ROW))
             if len(values) == len(ROW_LENGTHS):
                 calib = CalibrationSet(unit, values['wavCoef'], values['radSens'],
-                                       values['irrSens'], values['linCoefs'])
+                                       values['irrSens'], values['linCoefs'],
+                                       dict(zip('ri', vcc)))
                 # Byte identical to the rows the app ships with means nobody has
                 # calibrated this unit yet. It is a placeholder, not a measurement
                 # of the hardware in front of you.
@@ -233,7 +268,8 @@ class CalibrationStore:
             if len(row) < 2:
                 return False
             try:
-                return int(row[0]) == calib.unit_number and row[1] in ROW_LENGTHS
+                return (int(row[0]) == calib.unit_number
+                        and (row[1] in ROW_LENGTHS or row[1] == VCC_ROW))
             except ValueError:
                 return False
 
@@ -244,6 +280,9 @@ class CalibrationStore:
             self._pad([calib.unit_number, 'irrSens'] + list(calib.irr_sens)),
             self._pad([calib.unit_number, 'linCoefs'] + list(calib.lin_coefs)),
         ]
+        if any(calib.vcc_ref.values()):
+            new_rows.append(self._pad([calib.unit_number, VCC_ROW]
+                                      + [calib.vcc_ref[m] or 0 for m in 'ri']))
 
         directory = os.path.dirname(os.path.abspath(self.path))
         handle = tempfile.NamedTemporaryFile('w', newline='', dir=directory,

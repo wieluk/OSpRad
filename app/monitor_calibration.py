@@ -3,14 +3,15 @@
 # a fitted PsychCal .mat.
 #
 # Psychtoolbox: the .mat loads directly via `cal = LoadCalFile(...)` (no MATLAB
-# side step, matching CalibrateMonSpd). The linear device model
-# (P_device/T_device/raw gamma weights) ports PTB's CalibrateFitLinMod/
-# FindModelWeights exactly. The tone curve is a monotone PCHIP, NOT a port of
-# PTB's CalibrateFitGamma: that algorithm wasn't confirmable from source, and a
-# partial reimplementation risked a plausible but wrong curve.
+# side step, matching CalibrateMonSpd). As in PTB's CalibrateMonDrvr, black (mean
+# of before and after the sweep) is subtracted and stored as P_ambient, spectra are
+# power per wavelength band, and T_device/T_ambient are WlsToT(S). The linear
+# device model ports CalibrateFitLinMod (nPrimaryBases=1). The tone curve is a
+# monotone PCHIP, NOT a port of PTB's CalibrateFitGamma: that algorithm wasn't
+# confirmable from source, and a partial reimplementation risked a plausible but
+# wrong curve.
 # cal.describe.gamma.fitType says 'OSpRad-pchip' so the difference is visible
-# rather than implied away. T_device/T_ambient use OSpRad's own analytic CIE
-# 1931 approximation, close to but not bit identical with PTB's tables.
+# rather than implied away.
 
 import io
 import logging
@@ -48,9 +49,9 @@ def resample_to_ptb_grid(wavelength, flux, s_spec):
 
 def fit_linear_device_model(mon_by_channel):
     """Port PTB's CalibrateFitLinMod for the single primary basis case
-    (cal.nPrimaryBases=1): P_device is each channel's spectrum at its highest
-    level; raw_gamma weights are the least squares projection of each level's
-    spectrum onto that basis (`lstsq`)."""
+    (cal.nPrimaryBases=1): P_device is each channel's highest level projected onto
+    its first SVD component; raw_gamma weights are the least squares projection of
+    each level's spectrum onto that basis (`lstsq`)."""
     n_channels = len(mon_by_channel)
     n_meas = len(mon_by_channel[0])
     s3 = len(mon_by_channel[0][0])
@@ -58,7 +59,8 @@ def fit_linear_device_model(mon_by_channel):
     raw_gamma = np.zeros((n_meas, n_channels))
     for ch in range(n_channels):
         levels = np.stack(mon_by_channel[ch], axis=1)  # [S3, nMeas]
-        basis = levels[:, -1]
+        u = np.linalg.svd(levels, full_matrices=False)[0][:, 0]
+        basis = u * (u @ levels[:, -1])
         p_device[:, ch] = basis
         denom = float(basis @ basis)
         raw_gamma[:, ch] = (basis @ levels) / denom if denom > 0 else 0.0
@@ -153,17 +155,11 @@ def fit_gamma_curve(gamma_input, raw_gamma, n_output=1024):
     return gamma_output.reshape(-1, 1), table
 
 
-def build_t_device(wavelength_grid):
-    """CIE 1931 XYZ colour matching functions at wavelength_grid, as PTB's
-    T_device/T_ambient. Reuses calibration.py's analytic piecewise Gaussian
-    approximation. Close to PTB's tabulated data but not bit identical."""
-    x = np.array([calibration._piecewise_gaussian(w, calibration.CIE_X_COEFS)
-                 for w in wavelength_grid])
-    y = np.array([calibration._piecewise_gaussian(w, calibration.CIE_Y_COEFS)
-                 for w in wavelength_grid])
-    z = np.array([calibration._piecewise_gaussian(w, calibration.CIE_Z_COEFS)
-                 for w in wavelength_grid])
-    return np.vstack([x, y, z])
+def luminance(spd, s_spec):
+    """cd/sqm of a W/(sr*sqm*nm) spectrum on the PTB grid."""
+    start, delta, n = s_spec
+    ybar = calibration.cmf(start + delta * np.arange(n))[1]
+    return 683 * float(np.sum(np.asarray(spd) * ybar)) * delta
 
 
 class PatchWindow(QWidget):
@@ -345,7 +341,7 @@ class MonitorCalibrationTab(QWidget):
         self._n_levels = n_levels
         self._sweep_steps = self._build_step_list(n_levels)
         self._sweep_index = 0
-        self._sweep_results = {'ambient': None, 'mon_by_channel': [[], [], []]}
+        self._sweep_results = {'ambient': [], 'mon_by_channel': [[], [], []]}
         self.start_button.setEnabled(False)
         self.cancel_button.setEnabled(True)
         self.export_csv_button.setEnabled(False)
@@ -373,6 +369,7 @@ class MonitorCalibrationTab(QWidget):
                 text = ('Measuring %s %d/255 (step %d/%d)...'
                        % (self.CHANNEL_NAMES[ch], level, step_num, total))
                 steps.append((ch, tuple(rgb), text))
+        steps.append(('ambient', (0, 0, 0), 'Measuring ambient again (black screen)...'))
         return steps
 
     def _cancel(self):
@@ -413,14 +410,14 @@ class MonitorCalibrationTab(QWidget):
         calibration math only. Qt widgets are not thread safe."""
         measurement = connection.measure('r')
         calib = store.get(measurement.unit_number)
-        flux = calib.to_flux(measurement.raw_counts, 'r', measurement.int_time)
+        flux = calib.to_flux(measurement.raw_counts, 'r', measurement.int_time, measurement.vcc)
         _, resampled = resample_to_ptb_grid(calib.wavelength, flux, DEFAULT_PTB_S)
         return kind, resampled
 
     def _measurement_done(self, result):
         kind, spd = result
         if kind == 'ambient':
-            self._sweep_results['ambient'] = spd
+            self._sweep_results['ambient'].append(spd)
         else:
             self._sweep_results['mon_by_channel'][kind].append(spd)
         self._sweep_index += 1
@@ -446,9 +443,10 @@ class MonitorCalibrationTab(QWidget):
             self.status.setText('Cancelled.')
             return
 
-        ambient = self._sweep_results['ambient']
+        ambient = np.mean(self._sweep_results['ambient'], axis=0)
         mon_by_channel = self._sweep_results['mon_by_channel']
-        gamma_input = np.linspace(0.0, 1.0, self._n_levels + 1)[1:]
+        # The levels actually displayed, after rounding to 8 bits.
+        gamma_input = np.round(np.linspace(0.0, 1.0, self._n_levels + 1)[1:] * 255) / 255
         self._result = {
             's_spec': DEFAULT_PTB_S,
             'gamma_input': gamma_input,
@@ -474,10 +472,13 @@ class MonitorCalibrationTab(QWidget):
         ax.clear()
         self.plot._style_axes()
         ax.set_xlabel('Input level (0-255)')
-        ax.set_ylabel('Relative luminance (sum of resampled spectrum)')
+        ax.set_ylabel('Luminance above black (cd/m\N{SUPERSCRIPT TWO})')
+        s_spec = self._result['s_spec']
+        black = luminance(self._result['ambient'], s_spec)
         ax.set_title('Gamma sweep preview; closer to a smooth curve is better', fontsize=10)
         for ch in range(3):
-            totals = [float(np.sum(spd)) for spd in self._result['mon_by_channel'][ch]]
+            totals = [luminance(spd, s_spec) - black
+                      for spd in self._result['mon_by_channel'][ch]]
             ax.plot(levels_255, totals, color=self.CHANNEL_COLORS[ch], marker='o',
                    markersize=3, linewidth=1.2, label=self.CHANNEL_NAMES[ch])
         ax.legend(fontsize=9)
@@ -524,8 +525,10 @@ class MonitorCalibrationTab(QWidget):
         s_spec = self._result['s_spec']
         s3 = s_spec[2]
         n_levels = self._result['n_levels']
-        wavelength_grid = s_spec[0] + s_spec[1] * np.arange(s3)
-        mon_by_channel = self._result['mon_by_channel']
+        # PTB units are power per wavelength band, with black subtracted (EnforcePos).
+        ambient = self._result['ambient'] * s_spec[1]
+        mon_by_channel = [[np.maximum(spd * s_spec[1] - ambient, 0.0) for spd in channel]
+                          for channel in self._result['mon_by_channel']]
 
         mon = np.zeros((s3 * n_levels, 3))
         for ch in range(3):
@@ -535,7 +538,7 @@ class MonitorCalibrationTab(QWidget):
         p_device, raw_gamma = fit_linear_device_model(mon_by_channel)
         gamma_input = self._result['gamma_input']
         gamma_output, gamma_table = fit_gamma_curve(gamma_input, raw_gamma)
-        t_device = build_t_device(wavelength_grid)
+        t_device = np.eye(s3)  # PTB's WlsToT(S)
 
         cal = {
             'describe': {
@@ -563,7 +566,7 @@ class MonitorCalibrationTab(QWidget):
             'gammaInput': gamma_output,
             'gammaTable': gamma_table,
             'gammaFormat': 0.0,
-            'P_ambient': np.asarray(self._result['ambient'], dtype=float).reshape(-1, 1),
+            'P_ambient': ambient.reshape(-1, 1),
             'S_ambient': np.array(s_spec, dtype=float).reshape(1, 3),
             'T_ambient': t_device,
         }

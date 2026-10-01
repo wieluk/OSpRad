@@ -13,6 +13,8 @@ log = logging.getLogger('osprad.datalog')
 #   0:label 1:unit# 2:date 3:time 4:mode 5:intTime 6:nScans 7:saturated
 #   8:luminance label 9:luminance 10:flux unit label 11..298:flux (288 values)
 #   299:"rawCounts:" 300..587:rawCounts (288 values)
+# A header row (wavelength axis) is repeated whenever the axis changes; each reading
+# belongs to the nearest header above it.
 IDX_LABEL = 0
 IDX_UNIT = 1
 IDX_DATE = 2
@@ -32,14 +34,17 @@ ReadingIndex = collections.namedtuple(
 
 SavedReading = collections.namedtuple(
     'SavedReading', 'label unit_number date time mode int_time n_scans saturated '
-                     'luminance flux raw_counts')
+                     'luminance flux raw_counts wavelength')
+
+HEADER_PREFIX = 'label,unit#,'
+_last_header = {}  # path -> (file size, last header line), to avoid rescanning on save
 
 
 def format_measurement(mode, measurement, flux, luminance, wavelength):
     """Bundle everything needed to write one reading: settings row, data row, and
     the wavelength axis used for the CSV header (round tripped via append_reading)."""
     counts = [f'{c:.4f}' for c in measurement.raw_counts]
-    flux_fields = [f'{flux[0]:.4f}'] + [f'{f:.4e}' for f in flux[1:]]
+    flux_fields = [f'{f:.4e}' for f in flux]
 
     if mode == 'i':
         data = ['lux:', f'{luminance:.4e}', 'W/(sqm*nm):'] + flux_fields
@@ -59,24 +64,44 @@ def _header_row(wavelength):
 
 
 def append_reading(path, label, unit_number, settings, data, wavelength):
-    """Appends one reading row to path (writing a header first if the file is new or empty).
+    """Appends one reading row to path, after a header if the file's last one has another axis.
 
     Returns the byte offset of the row just written, so callers can index straight back
     to it (via load_reading) without rescanning the file.
     """
-    needs_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    buf = io.StringIO()
+    csv.writer(buf).writerow(_header_row(wavelength))
+    header = buf.getvalue()
+    size = os.path.getsize(path) if os.path.exists(path) else 0
+    if _last_header.get(path, (None,))[0] != size:
+        _last_header[path] = (size, _find_header(path, size))
 
     with open(path, 'a', newline='') as handle:
         writer = csv.writer(handle)
-        if needs_header:
-            writer.writerow(_header_row(wavelength))
+        if _last_header[path][1] != header:
+            handle.write(header)
         t = time.localtime()
         row = ([label, str(unit_number), time.strftime('%Y-%m-%d', t),
                 time.strftime('%H:%M:%S', t)] + settings + data)
         offset = handle.tell()
         writer.writerow(row)
+    _last_header[path] = (os.path.getsize(path), header)
     log.debug('Appended reading %r for unit %s at offset %d', label, unit_number, offset)
     return offset
+
+
+def _find_header(path, end):
+    """The last header line before byte offset end, or None."""
+    header = None
+    if end:
+        with open(path, 'r', newline='') as handle:
+            while handle.tell() < end:
+                line = handle.readline()
+                if not line:
+                    break
+                if line.startswith(HEADER_PREFIX):
+                    header = line
+    return header
 
 
 def iter_index(path):
@@ -158,22 +183,28 @@ def export_text(path, offsets):
     """
     offsets = set(offsets)
     out = []
+    header = written = None
     with open(path, 'r', newline='') as src:
         while True:
             offset = src.tell()
             line = src.readline()
             if not line:
                 break
-            if offset == 0 or offset in offsets:
+            if line.startswith(HEADER_PREFIX):
+                header = line
+            elif offset in offsets:
+                if header != written:
+                    out.append(header)
+                    written = header
                 out.append(line)
-    log.debug('exported %d of %d requested rows from %s', max(0, len(out) - 1),
-              len(offsets), path)
+    log.debug('exported %d requested rows from %s', len(offsets), path)
     return ''.join(out)
 
 
 def load_reading(path, offset):
     """Loads one full reading (flux + raw counts included) from its byte offset,
     as previously yielded by iter_index() or returned by append_reading()."""
+    header = _find_header(path, offset)
     with open(path, 'r', newline='') as handle:
         handle.seek(offset)
         line = handle.readline()
@@ -186,4 +217,6 @@ def load_reading(path, offset):
         n_scans=int(row[IDX_N_SCANS]), saturated=float(row[IDX_SATURATED]),
         luminance=float(row[IDX_LUMINANCE]),
         flux=[float(v) for v in row[IDX_FLUX_START:IDX_FLUX_END]],
-        raw_counts=[float(v) for v in row[IDX_COUNTS_START:IDX_COUNTS_END]])
+        raw_counts=[float(v) for v in row[IDX_COUNTS_START:IDX_COUNTS_END]],
+        wavelength=([float(v) for v in next(csv.reader([header]))[IDX_FLUX_START:IDX_FLUX_END]]
+                    if header else None))

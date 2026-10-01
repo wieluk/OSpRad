@@ -18,7 +18,8 @@ Prebuilt binaries are attached to each
 | File | Platform |
 | --- | --- |
 | `OSpRad-<version>-windows-x64.exe` | Windows |
-| `OSpRad-<version>-macos.zip` | macOS (unzip to get `OSpRad.app`) |
+| `OSpRad-<version>-macos-arm64.zip` | macOS, Apple Silicon (unzip to get `OSpRad.app`) |
+| `OSpRad-<version>-macos-x86_64.zip` | macOS, Intel |
 | `OSpRad-<version>-linux-x86_64.AppImage` | Linux (chmod +x, then run) |
 | `OSpRad-<version>-linux-x86_64.tar.gz` | Linux without FUSE (extract, run `OSpRad/OSpRad`) |
 | `OSpRad-<version>-android-arm64.apk` | Android (sideload) |
@@ -37,15 +38,17 @@ pip install -r app/requirements.txt
 python app/OSpRad.py
 ```
 
-The app writes `data.csv` next to itself (or, for a `pip install`, to a per user
-directory like `~/.local/share/OSpRad`). Keep `app/*.py` together with the
+The app writes `data.csv` next to itself (or, for a `pip install` and on macOS, to a
+per user directory like `~/.local/share/OSpRad` or `~/Library/Application Support/OSpRad`).
+The macOS app is unsigned: on first launch right click it and choose **Open**. Keep `app/*.py` together with the
 `calibration_data.csv` they ship with.
 
 ## Use the app
 
 Plug the OSpRad in over USB (which also powers it) and launch the app. On Windows
 you may need to install a driver for the Nano's USB serial chip (CH340 or FTDI,
-depending on the clone) if it does not show up in Device Manager.
+depending on the clone) if it does not show up in Device Manager. On Linux, add
+yourself to the group owning the port (`dialout`, or `uucp` on Arch) and log in again.
 
 The main tab holds three modes, one open at a time. **Measurement** for a single
 Radiance or Irradiance reading, **Continuous mode** for a live, refreshing plot,
@@ -88,7 +91,9 @@ sinks into the noise, and neither recovers until you untick the box. Readings
 taken while the dark was held cannot be saved to the history.
 
 The app and firmware are released together and must share a major version
-(currently 1.x). If connecting reports an unexpected reply, reflash. `data.csv`
+(currently 1.x). If connecting reports an unexpected reply, reflash. Firmware 1.1.0
+adds exact exposure timing and supply voltage readings; refit the linearisation
+after upgrading. `data.csv`
 files written by the original upstream 1.x app are not readable; the column
 layout changed when the firmware gained the framed reply protocol.
 
@@ -162,6 +167,11 @@ the CSV:
 
 The spreadsheets in `calibration/` document the full derivation for reference.
 
+The Nano's ADC measures against its USB supply, so readings scale with 1/Vcc. With
+firmware 1.1.0, a sensitivity saved from the app stores the supply it was measured
+at (the optional `vccRef` row, radiance and irradiance in mV) and later readings are
+scaled back to it. Older calibrations stay uncorrected until re saved.
+
 ## Calibrate a monitor
 
 **Monitor calibration** steps a fullscreen patch through black, then through a
@@ -173,9 +183,8 @@ Psychtoolbox...** writes a fitted PsychCal `.mat` file that loads with
 tone curve choices; `cal.describe.gamma.fitType` says `OSpRad pchip` so the
 difference from PTB's pipeline is visible rather than implied away.
 
-Calibrate in as dark a room as practical. The tab measures one black screen
-ambient, but the OSpRad's dark frame subtraction handles sensor noise, not room
-ambient.
+Calibrate in as dark a room as practical. The black screen, measured before and
+after the sweep, is subtracted before fitting, as Psychtoolbox does.
 
 ## For developers
 

@@ -28,6 +28,7 @@ log = logging.getLogger('osprad.calibration_wizard')
 
 PIXELS = calibration.PIXELS
 SAT_VALUE = 1000  # firmware's over exposure threshold, used to normalise linCoefs
+SENSOR_FWHM_NM = 9.0  # C12880MA spectral resolution
 
 # Servo/wheel mechanism stalls outside this range on the reference unit; see serial_io.
 WHEEL_MIN_ANGLE = 15
@@ -89,16 +90,33 @@ def golden_section_minimize(objective, lo, hi, tol=1e-10, max_iter=500):
     return (a + b) / 2
 
 
-def gaussian_smooth(values, sigma):
-    """Gaussian kernel smoothing, matching the calibration spreadsheet."""
+def gaussian_smooth(values, sigma, valid=None):
+    """Gaussian kernel smoothing, matching the calibration spreadsheet. Only `valid`
+    samples are averaged, so zeros beside the data don't drag its edges down."""
+    values = np.asarray(values, dtype=float)
     if sigma <= 0:
         return list(values)
+    valid = np.ones(len(values), dtype=bool) if valid is None else np.asarray(valid)
     radius = max(1, int(math.ceil(sigma * 3)))
     offsets = np.arange(-radius, radius + 1)
     kernel = np.exp(-(offsets ** 2) / (2.0 * sigma ** 2))
-    kernel /= kernel.sum()
-    padded = np.pad(np.asarray(values, dtype=float), radius, mode='edge')
-    return list(np.convolve(padded, kernel, mode='valid'))
+    num = np.convolve(np.pad(np.where(valid, values, 0.0), radius, mode='edge'), kernel, 'valid')
+    den = np.convolve(np.pad(valid.astype(float), radius, mode='edge'), kernel, 'valid')
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return list(np.where(valid & (den > 0), num / den, values))
+
+
+def blur_spectrum(wavelength, values, fwhm, at):
+    """Reference spectrum seen through a Gaussian bandpass of fwhm (nm) at wavelengths
+    `at`, NaN outside it. Unblurred, its sharp lines become spikes in the sensitivity."""
+    wavelength = np.asarray(wavelength, dtype=float)
+    at = np.asarray(at, dtype=float)
+    sigma = fwhm / (2.0 * math.sqrt(2.0 * math.log(2.0)))
+    weights = (np.exp(-0.5 * ((wavelength - at[:, None]) / sigma) ** 2)
+               * np.gradient(wavelength))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        blurred = weights @ np.asarray(values, dtype=float) / weights.sum(axis=1)
+    return np.where((at >= wavelength[0]) & (at <= wavelength[-1]), blurred, np.nan)
 
 
 class UnitSetupTab(QWidget):
@@ -490,7 +508,9 @@ class LinearisationTab(QWidget):
         def objective(b):
             return float(np.sum(residuals([b]) ** 2))
 
-        b = golden_section_minimize(objective, 1e-3, 1e6)
+        # Searched in log(b), and from just above 1 so ln((count + 1) * b) stays positive.
+        b = math.exp(golden_section_minimize(lambda u: objective(math.exp(u)),
+                                             math.log(1.01), math.log(1e6)))
         a = 1.0 / math.log((SAT_VALUE + 1) * b)
         return [a, b]
 
@@ -756,7 +776,7 @@ class SensitivityTab(QWidget):
         factor = measured / reference
         values = [v * factor for v in calib.sensitivity(mode)]
         self._stage(calib, values, 'Measured %.4g, reference %.4g; sensitivity scaled by %.4f.'
-                    % (measured, reference, factor))
+                    % (measured, reference, factor), measurement.vcc)
 
     def _derive(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -786,8 +806,7 @@ class SensitivityTab(QWidget):
         calib._derive()
         wavelength = np.asarray(calib.wavelength)
         bins = np.asarray(calib.wavelength_bins)
-        expected = np.interp(wavelength, reference[:, 0], reference[:, 1],
-                             left=np.nan, right=np.nan)
+        expected = blur_spectrum(reference[:, 0], reference[:, 1], SENSOR_FWHM_NM, wavelength)
 
         linear = np.array([calibration.linearize(c, calib.lin_coefs)
                            for c in measurement.raw_counts])
@@ -800,17 +819,17 @@ class SensitivityTab(QWidget):
             sigma = float(self.sigma_edit.text())
         except ValueError:
             sigma = 0.0
-        smoothed = np.array(gaussian_smooth(sens, sigma))
+        smoothed = np.array(gaussian_smooth(sens, sigma, valid=sens > 0))
         smoothed[sens <= 0] = 0.0
 
         covered = int(np.count_nonzero(smoothed))
         self._stage(calib, list(smoothed), (
             'Derived sensitivity across %d of %d photosites (the rest fall outside the '
             'reference spectrum\'s wavelength range and are left at zero).'
-            % (covered, PIXELS)))
+            % (covered, PIXELS)), measurement.vcc)
 
-    def _stage(self, calib, values, message):
-        self.pending = (calib, self._mode(), list(values))
+    def _stage(self, calib, values, message, vcc=None):
+        self.pending = (calib, self._mode(), list(values), vcc)
         self.status.setText(message + ' Review the curve, then Save.')
         self.save_button.setEnabled(True)
         calib._derive()
@@ -820,7 +839,8 @@ class SensitivityTab(QWidget):
                             calib.unit_number))
 
     def _save(self):
-        calib, mode, values = self.pending
+        calib, mode, values, vcc = self.pending
+        calib.vcc_ref[mode] = vcc
         if mode == 'i':
             calib.irr_sens = values
         else:
