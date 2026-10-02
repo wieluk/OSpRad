@@ -45,6 +45,7 @@ py-modules = [
     "cie_cmf",
     "datalog",
     "file_io",
+    "inspection_sheet",
     "flasher",
     "monitor_calibration",
     "plotting",

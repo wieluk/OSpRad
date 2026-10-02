@@ -6,6 +6,7 @@ import os
 import tempfile
 
 import numpy as np
+from numpy.polynomial import polynomial as P
 
 import cie_cmf
 
@@ -66,8 +67,13 @@ ROW_LENGTHS = {
     'linCoefs': 2,
 }
 
-# Optional supply voltage (mV) the radiance and irradiance sensitivities were measured at.
+# Optional rows: the supply voltage (mV) the radiance and irradiance sensitivities
+# were measured at; the sensor's serial number; and which of the rows above are still
+# placeholders taken from another unit rather than measured on this one.
 VCC_ROW = 'vccRef'
+SERIAL_ROW = 'sensorSerial'
+PLACEHOLDER_ROW = 'placeholder'
+OPTIONAL_ROWS = (VCC_ROW, SERIAL_ROW, PLACEHOLDER_ROW)
 
 
 class CalibrationError(Exception):
@@ -84,16 +90,16 @@ def linearize(count, lin_coefs):
 
 
 class CalibrationSet:
-    def __init__(self, unit_number, wav_coef, rad_sens, irr_sens, lin_coefs, vcc_ref=None):
+    def __init__(self, unit_number, wav_coef, rad_sens, irr_sens, lin_coefs, vcc_ref=None,
+                 serial='', placeholders=()):
         self.unit_number = unit_number
         self.wav_coef = wav_coef
         self.rad_sens = rad_sens
         self.irr_sens = irr_sens
         self.lin_coefs = lin_coefs
         self.vcc_ref = dict({'r': None, 'i': None}, **(vcc_ref or {}))
-        # True only for units still carrying the calibration the app ships with; see
-        # CalibrationStore.load.
-        self.is_default = False
+        self.serial = serial
+        self.placeholders = set(placeholders)
         self._derived = False
 
     def _derive(self):
@@ -106,6 +112,24 @@ class CalibrationSet:
         # Central differences, so each bin is centred on its photosite.
         self.wavelength_bins = list(np.gradient(self.wavelength))
         self._derived = True
+
+    def set_wavelength(self, wav_coef, serial=''):
+        """New wavelength axis. Placeholder sensitivity curves are re-transferred onto it;
+        returns the rows that were measured on the old axis and should be redone."""
+        self.wav_coef = list(wav_coef)
+        self.serial = serial
+        self.placeholders.discard('wavCoef')
+        self._derived = False
+        self._derive()
+        stale = []
+        template = template_unit()
+        for row, attr in (('radSens', 'rad_sens'), ('irrSens', 'irr_sens')):
+            if row in self.placeholders and template is not None:
+                setattr(self, attr, transfer(getattr(template, attr), template.wavelength,
+                                             self.wavelength))
+            elif row not in self.placeholders:
+                stale.append(row)
+        return stale
 
     def sensitivity(self, mode):
         return self.irr_sens if mode == 'i' else self.rad_sens
@@ -168,15 +192,71 @@ def _parse_rows(handle):
     return rows
 
 
+def hamamatsu_to_wav_coef(coefficients):
+    """Hamamatsu's A0, B1..B5 count pixels from 1; the app's wavCoef from 0."""
+    out = [0.0] * 6
+    for k, a in enumerate(coefficients):
+        for j, c in enumerate(P.polypow([1, 1], k)):
+            out[j] += a * c
+    return out
+
+
+def wav_coef_to_hamamatsu(wav_coef):
+    out = [0.0] * 6
+    for k, a in enumerate(wav_coef):
+        for j, c in enumerate(P.polypow([-1, 1], k)):
+            out[j] += a * c
+    return out
+
+
+def transfer(sens, from_wavelength, to_wavelength):
+    """A sensitivity curve moved to another sensor's axis by wavelength (not pixel),
+    zero outside the range the source curve covers."""
+    sens = np.asarray(sens, dtype=float)
+    valid = sens > 0
+    if not valid.any():
+        return [0.0] * PIXELS
+    lo, hi = np.asarray(from_wavelength)[valid][[0, -1]]
+    to = np.asarray(to_wavelength)
+    out = np.interp(to, from_wavelength, sens, left=0.0, right=0.0)
+    out[(to < lo) | (to > hi)] = 0.0
+    return list(out)
+
+
+def template_unit():
+    """The first unit shipped with the app, whose curves stand in for a new unit's
+    until they are measured. None if the app ships none."""
+    rows = _bundled_rows()
+    for unit in sorted(rows):
+        try:
+            calib = CalibrationSet(unit, *[[float(v) for v in rows[unit][r]] for r in ROW_LENGTHS])
+        except (KeyError, ValueError):
+            continue
+        calib._derive()
+        return calib
+    return None
+
+
+def new_unit(unit_number, wav_coef, serial=''):
+    """Calibration for a unit that has none: its own wavelengths, the template's
+    sensitivity (moved onto them) and linearisation as placeholders."""
+    template = template_unit()
+    if template is None:
+        raise CalibrationError('This build of the app has no template calibration.')
+    calib = CalibrationSet(unit_number, list(wav_coef), [0.0] * PIXELS, [0.0] * PIXELS,
+                           list(template.lin_coefs), serial=serial,
+                           placeholders={'radSens', 'irrSens', 'linCoefs'})
+    calib._derive()
+    calib.rad_sens = transfer(template.rad_sens, template.wavelength, calib.wavelength)
+    calib.irr_sens = transfer(template.irr_sens, template.wavelength, calib.wavelength)
+    return calib
+
+
 _BUNDLED_ROWS = None
 
 
 def _bundled_rows():
-    """The calibration rows shipped inside the app, parsed once.
-
-    Used to tell "this unit has never been calibrated, it is still on the defaults
-    we shipped" from "someone has actually calibrated or imported this unit".
-    """
+    """The calibration rows shipped inside the app, parsed once."""
     global _BUNDLED_ROWS
     if _BUNDLED_ROWS is None:
         try:
@@ -225,14 +305,11 @@ class CalibrationStore:
                 vcc = []
                 problems.append("Unit %d: '%s' contains non numeric values." % (unit, VCC_ROW))
             if len(values) == len(ROW_LENGTHS):
-                calib = CalibrationSet(unit, values['wavCoef'], values['radSens'],
-                                       values['irrSens'], values['linCoefs'],
-                                       dict(zip('ri', vcc)))
-                # Byte identical to the rows the app ships with means nobody has
-                # calibrated this unit yet. It is a placeholder, not a measurement
-                # of the hardware in front of you.
-                calib.is_default = (by_type == _bundled_rows().get(unit))
-                units[unit] = calib
+                units[unit] = CalibrationSet(
+                    unit, values['wavCoef'], values['radSens'], values['irrSens'],
+                    values['linCoefs'], dict(zip('ri', vcc)),
+                    serial=(by_type.get(SERIAL_ROW) or [''])[0],
+                    placeholders=[r for r in by_type.get(PLACEHOLDER_ROW, []) if r in ROW_LENGTHS])
 
         if not units:
             problems.append("No usable calibration data found in %s." % self.path)
@@ -249,14 +326,13 @@ class CalibrationStore:
     def get(self, unit_number):
         if unit_number not in self.units:
             raise CalibrationError(
-                "No calibration data for unit #%d.\nEnsure %s has data for this unit, "
-                "or run the calibration wizard." % (unit_number, self.path))
+                "No calibration for unit #%d yet. Load its sensor's inspection sheet in "
+                "Calibrate \N{RIGHTWARDS ARROW} Wavelength to start one." % unit_number)
         return self.units[unit_number]
 
     def save_unit(self, calib):
-        """Write (or replace) one unit's four rows, preserving the padded CSV format."""
+        """Write (or replace) one unit's rows, preserving the padded CSV format."""
         log.info('Saving calibration for unit #%d to %s', calib.unit_number, self.path)
-        calib.is_default = False
         self.units[calib.unit_number] = calib
 
         existing = []
@@ -269,7 +345,7 @@ class CalibrationStore:
                 return False
             try:
                 return (int(row[0]) == calib.unit_number
-                        and (row[1] in ROW_LENGTHS or row[1] == VCC_ROW))
+                        and (row[1] in ROW_LENGTHS or row[1] in OPTIONAL_ROWS))
             except ValueError:
                 return False
 
@@ -283,13 +359,18 @@ class CalibrationStore:
         if any(calib.vcc_ref.values()):
             new_rows.append(self._pad([calib.unit_number, VCC_ROW]
                                       + [calib.vcc_ref[m] or 0 for m in 'ri']))
+        if calib.serial:
+            new_rows.append(self._pad([calib.unit_number, SERIAL_ROW, calib.serial]))
+        if calib.placeholders:
+            new_rows.append(self._pad([calib.unit_number, PLACEHOLDER_ROW]
+                                      + [r for r in ROW_LENGTHS if r in calib.placeholders]))
 
         directory = os.path.dirname(os.path.abspath(self.path))
         handle = tempfile.NamedTemporaryFile('w', newline='', dir=directory,
                                              delete=False, suffix='.tmp')
         try:
             with handle:
-                csv.writer(handle).writerows(kept + new_rows)
+                csv.writer(handle, lineterminator='\n').writerows(kept + new_rows)
             os.replace(handle.name, self.path)
         except BaseException:
             os.unlink(handle.name)

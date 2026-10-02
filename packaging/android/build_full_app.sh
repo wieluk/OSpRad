@@ -177,6 +177,7 @@ echo "=== Staging app source ==="
 mkdir -p "$WORK_DIR/osprad_full"
 cp "$REPO_ROOT/app/OSpRad.py" "$WORK_DIR/osprad_full/main.py"
 for f in analysis.py calibration.py calibration_io.py calibration_wizard.py cie_cmf.py datalog.py \
+         inspection_sheet.py \
          file_io.py monitor_calibration.py plotting.py qt_worker.py serial_io.py shell.py \
          theme.py touch.py ui.py updates.py updates_page.py flasher.py _version.py \
          _icon_bundled.py _calibration_data_bundled.py _font_bundled.py _firmware_bundled.py; do

@@ -82,6 +82,11 @@ def build_export(calib, config=None, fields=None):
     for key, mode in SENS_MODES.items():
         if key in fields and calib.vcc_ref[mode]:
             data[key + 'Vcc'] = calib.vcc_ref[mode]
+    if 'wavCoef' in fields and calib.serial:
+        data['sensorSerial'] = calib.serial
+    placeholders = [key for key in CSV_FIELDS if key in fields and key in calib.placeholders]
+    if placeholders:
+        data['placeholders'] = placeholders
     if WHEEL_FIELD in fields and config is not None:
         data[WHEEL_FIELD] = {'dark': config.dark, 'irr': config.irr, 'rad': config.rad}
     return data
@@ -140,6 +145,9 @@ def loads(text, source='the file'):
     for key in SENS_MODES:
         if key in values and isinstance(data.get(key + 'Vcc'), (int, float)):
             values[key + 'Vcc'] = float(data[key + 'Vcc'])
+    if 'wavCoef' in values and isinstance(data.get('sensorSerial'), str):
+        values['sensorSerial'] = data['sensorSerial']
+    values['placeholders'] = [k for k in data.get('placeholders') or [] if k in values]
 
     wheel = data.get(WHEEL_FIELD)
     if wheel is not None:
@@ -157,7 +165,7 @@ def loads(text, source='the file'):
                     'Calibration file\'s wheel angle for "%s" is not a number.' % role) from exc
         wheel = parsed
 
-    if not values and wheel is None:
+    if not any(key in values for key in CSV_FIELDS) and wheel is None:
         raise CalibrationIOError('Calibration file contains no calibration data at all.')
 
     log.debug('Imported unit #%d from %s: %s', unit_number, source,
@@ -200,7 +208,11 @@ def merge(store, imported, fields):
         pick('irrSens', 'irr_sens'),
         pick('linCoefs', 'lin_coefs'),
         {mode: imported.values.get(key + 'Vcc') if key in selected
-         else existing and existing.vcc_ref[mode] for key, mode in SENS_MODES.items()})
+         else existing and existing.vcc_ref[mode] for key, mode in SENS_MODES.items()},
+        serial=(imported.values.get('sensorSerial', '') if 'wavCoef' in selected
+                else existing.serial if existing else ''),
+        placeholders=({k for k in existing.placeholders if k not in selected} if existing
+                      else set()) | {k for k in imported.values['placeholders'] if k in selected})
 
 
 def apply_wheel_positions(connection, wheel):

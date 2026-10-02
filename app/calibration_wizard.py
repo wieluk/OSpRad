@@ -9,7 +9,8 @@ import math
 from PySide6.QtCore import Qt, QTimer, QPointF, QRectF, QSize
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QFileDialog,
-                               QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+                               QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
+                               QLineEdit,
                                QMessageBox, QPushButton, QRadioButton, QSlider,
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
@@ -18,6 +19,7 @@ import numpy as np
 import calibration
 import calibration_io
 import file_io
+import inspection_sheet
 import plotting
 import serial_io
 # Re exported: these used to live here, and other modules import them from here.
@@ -122,10 +124,11 @@ def blur_spectrum(wavelength, values, fwhm, at):
 class UnitSetupTab(QWidget):
     """Set the three shutter wheel positions, saved to the Arduino's EEPROM."""
 
-    def __init__(self, connection, store=None):
+    def __init__(self, connection, store=None, on_unit_changed=None):
         super().__init__()
         self.connection = connection
         self.store = store
+        self._on_unit_changed = on_unit_changed or (lambda: None)
         self._connected_widgets = []
         self._last_sent_angle = None
         self._saved_angles = {'D': None, 'I': None, 'R': None}
@@ -138,12 +141,27 @@ class UnitSetupTab(QWidget):
         self.unit_banner = UnitBanner()
         layout.addWidget(self.unit_banner)
         layout.addWidget(wrapped_label(
-            'Set this unit\'s shutter wheel positions. Stored on the Arduino, so '
-            'this only needs doing once per unit (no reflashing). The unit number '
-            'lives on the Import & export step.'))
+            'Give the unit its own number and set its shutter wheel positions. Both '
+            'are stored on the Arduino, so this only needs doing once per unit.'))
 
         self.config_label = wrapped_label('')
         layout.addWidget(self.config_label)
+
+        unit_group = QGroupBox('Unit number')
+        unit_layout = QVBoxLayout(unit_group)
+        unit_layout.addWidget(wrapped_label(
+            'Calibration data is looked up by this number, so every unit needs its own. '
+            'A new unit reports 1 until it is set here.'))
+        unit_row = FlowLayout()
+        self.unit_number_edit = QLineEdit()
+        self.unit_number_edit.setFixedWidth(80)
+        unit_row.addWidget(self.unit_number_edit)
+        self.save_unit_button = QPushButton('Save to unit')
+        self.save_unit_button.clicked.connect(self._save_unit)
+        unit_row.addWidget(self.save_unit_button)
+        unit_layout.addLayout(unit_row)
+        layout.addWidget(unit_group)
+        self._connected_widgets += [self.unit_number_edit, self.save_unit_button]
 
         wheel_group = QGroupBox('Shutter wheel')
         wheel_layout = QVBoxLayout(wheel_group)
@@ -154,7 +172,8 @@ class UnitSetupTab(QWidget):
 
         slider_row = QHBoxLayout()
         minus_btn = QPushButton('-')
-        minus_btn.setFixedWidth(32)
+        minus_btn.setFixedSize(44, 40)
+        minus_btn.setStyleSheet('padding: 0;')
         minus_btn.clicked.connect(lambda: self._nudge(-1))
         slider_row.addWidget(minus_btn)
         self.angle_slider = QSlider(Qt.Orientation.Horizontal)
@@ -165,7 +184,8 @@ class UnitSetupTab(QWidget):
         self.angle_slider.sliderReleased.connect(self._jog_now)
         slider_row.addWidget(self.angle_slider, 1)
         plus_btn = QPushButton('+')
-        plus_btn.setFixedWidth(32)
+        plus_btn.setFixedSize(44, 40)
+        plus_btn.setStyleSheet('padding: 0;')
         plus_btn.clicked.connect(lambda: self._nudge(1))
         slider_row.addWidget(plus_btn)
         wheel_layout.addLayout(slider_row)
@@ -185,28 +205,26 @@ class UnitSetupTab(QWidget):
 
         # Stored positions per role, with "Go" to jog the wheel there for a visual
         # check and "Set as..." to overwrite from the current slider position.
-        positions_layout = QGridLayout()
-        for i, role in enumerate(('D', 'I', 'R')):
+        for role in ('D', 'I', 'R'):
             role_name = WHEEL_ROLE_NAMES[role]
-            positions_layout.addWidget(
-                captioned(QLabel(role_name + ':'), WHEEL_ROLE_HELP[role]), i, 0)
+            row = FlowLayout()
+            row.addWidget(captioned(QLabel(role_name + ':'), WHEEL_ROLE_HELP[role]))
             value_label = QLabel('-')
-            positions_layout.addWidget(value_label, i, 1)
+            row.addWidget(value_label)
             self._role_value_labels[role] = value_label
 
             go_role_btn = QPushButton('Go')
-            go_role_btn.setFixedWidth(48)
             go_role_btn.clicked.connect(lambda checked=False, r=role: self._go_to_position(r))
             tip(go_role_btn, 'Move the wheel to the saved %s position.' % role_name)
-            positions_layout.addWidget(go_role_btn, i, 2)
+            row.addWidget(go_role_btn)
             self._connected_widgets.append(go_role_btn)
 
             set_btn = QPushButton('Set as %s' % role_name)
             set_btn.clicked.connect(lambda checked=False, r=role: self._save_position(r))
             tip(set_btn, WHEEL_ROLE_HELP[role])
-            positions_layout.addWidget(set_btn, i, 3)
+            row.addWidget(set_btn)
             self._connected_widgets.append(set_btn)
-        wheel_layout.addLayout(positions_layout)
+            wheel_layout.addLayout(row)
         layout.addWidget(wheel_group)
 
         self.status = wrapped_label('')
@@ -228,6 +246,7 @@ class UnitSetupTab(QWidget):
         if connection:
             self._refresh(config)
         else:
+            self.config_label.show()
             self.config_label.setText('Not connected.')
             self.status.setText('')
             for label in self._role_value_labels.values():
@@ -240,11 +259,11 @@ class UnitSetupTab(QWidget):
             try:
                 config = self.connection.get_config()
             except serial_io.SpecError as exc:
+                self.config_label.show()
                 self.config_label.setText(str(exc))
                 return
-        state = 'configured' if config.configured else 'not yet configured (firmware defaults)'
-        self.config_label.setText(
-            'Unit #%d, firmware v%s, %s' % (config.unit_number, config.firmware, state))
+        self.config_label.hide()  # the banner above shows the unit; this line is for errors
+        self.unit_number_edit.setText(str(config.unit_number))
 
         self._saved_angles = {'D': config.dark, 'I': config.irr, 'R': config.rad}
         for role, label in self._role_value_labels.items():
@@ -253,6 +272,16 @@ class UnitSetupTab(QWidget):
                 label.setText('not set')
             else:
                 label.setText('%d deg' % angle)
+
+    def _save_unit(self):
+        try:
+            number = int(self.unit_number_edit.text())
+            self.connection.set_unit_number(number)
+        except (serial_io.SpecError, ValueError) as exc:
+            self.status.setText(str(exc))
+            return
+        self.status.setText('Unit number %d saved to the Arduino; reconnecting.' % number)
+        self._on_unit_changed()
 
     def _nudge(self, delta):
         self.angle_slider.setValue(
@@ -310,6 +339,175 @@ class UnitSetupTab(QWidget):
         self.angle_slider.setValue(angle)
         self._jog_now()
         self.status.setText('Moved to saved %s position (%d degrees).' % (role_name, angle))
+
+
+class WavelengthTab(QWidget):
+    """The sensor's own pixel-to-wavelength coefficients, from Hamamatsu's inspection
+    sheet or typed in. Saving them for a unit with no calibration starts one."""
+
+    FIELDS = ('A0', 'B1', 'B2', 'B3', 'B4', 'B5')
+
+    def __init__(self, connection, store, on_saved=None):
+        super().__init__()
+        self.connection = connection
+        self.store = store
+        self.config = None
+        self._on_saved = on_saved or (lambda: None)
+
+        layout = QVBoxLayout(self)
+        self.unit_banner = UnitBanner()
+        layout.addWidget(self.unit_banner)
+        layout.addWidget(wrapped_label(
+            'Every C12880MA is measured at the factory, and its own coefficients turn '
+            'pixel numbers into wavelengths. Another sensor\'s are several nm off. '
+            'They are on Hamamatsu\'s Final Inspection Sheet, on the CD-ROM in the '
+            'sensor\'s box (folder C12880MA_<order number>, file "C12880MA FINAL '
+            'INSPECTION SHEET_....xlsx"). Lost it? Ask the seller or Hamamatsu for the '
+            'sheet of the serial number printed on the sensor.'))
+
+        self.load_button = QPushButton('Load inspection sheet...')
+        set_role(self.load_button, 'primary')
+        self.load_button.clicked.connect(self._load_sheet)
+        layout.addWidget(self.load_button, alignment=Qt.AlignmentFlag.AlignLeft)
+
+        entry = QGroupBox('Or type them in')
+        grid = QGridLayout(entry)
+        grid.setColumnStretch(1, 1)
+        grid.addWidget(QLabel('Serial No.'), 0, 0)
+        self.serial_edit = QLineEdit()
+        grid.addWidget(self.serial_edit, 0, 1)
+        self.coef_edits = []
+        for row, name in enumerate(self.FIELDS, 1):
+            grid.addWidget(QLabel(name), row, 0)
+            edit = QLineEdit()
+            edit.textChanged.connect(self._preview)
+            grid.addWidget(edit, row, 1)
+            self.coef_edits.append(edit)
+        note = wrapped_label('As printed on the sheet, which numbers pixels 1 to 288.')
+        set_role(note, 'muted')
+        grid.addWidget(note, len(self.FIELDS) + 1, 0, 1, 2)
+        layout.addWidget(entry)
+
+        self.preview = wrapped_label('')
+        layout.addWidget(self.preview)
+        actions = FlowLayout()
+        self.save_button = QPushButton('Save')
+        set_role(self.save_button, 'primary')
+        self.save_button.clicked.connect(self._save)
+        actions.addWidget(self.save_button)
+        layout.addLayout(actions)
+        self.status = wrapped_label('')
+        layout.addWidget(self.status)
+        layout.addStretch(1)
+        self.set_connection(connection)
+
+    def set_connection(self, connection, config=None):
+        self.connection = connection
+        self.config = config if connection is not None else None
+        if self.config is not None:
+            self.unit_banner.set_config(config, self.store)
+        else:
+            self.unit_banner.set_disconnected()
+        self._show_current()
+
+    def _show_current(self):
+        try:
+            calib = self.store.get(self.config.unit_number) if self.config else None
+        except calibration.CalibrationError:
+            calib = None
+        if calib is None:
+            self._fill('', [''] * 6)
+            return
+        self._fill(calib.serial, [repr(float(v)) for v in
+                                  calibration.wav_coef_to_hamamatsu(calib.wav_coef)])
+
+    def _fill(self, serial, values):
+        self.serial_edit.setText(serial)
+        for edit, value in zip(self.coef_edits, values):
+            edit.setText(str(value))
+        self._preview()
+
+    def _coefficients(self):
+        try:
+            return [float(edit.text().replace(',', '.')) for edit in self.coef_edits]
+        except ValueError:
+            return None
+
+    def _preview(self):
+        coefs = self._coefficients()
+        ok = False
+        if coefs is None:
+            text = 'Enter all six coefficients.'
+        else:
+            pix = np.arange(1, PIXELS + 1)
+            wl = np.polynomial.polynomial.polyval(pix, coefs)
+            ok = bool(np.all(np.diff(wl) > 0) and 250 < wl[0] < 400 and 750 < wl[-1] < 1000)
+            text = ('Pixel 1 \N{RIGHTWARDS ARROW} %.1f nm, pixel 288 \N{RIGHTWARDS ARROW} '
+                    '%.1f nm.%s' % (wl[0], wl[-1], '' if ok else
+                                    ' That is not a C12880MA range; check the values.'))
+        self.preview.setText(text)
+        set_role(self.preview, 'muted' if ok else 'bad')
+        self.save_button.setEnabled(ok and self.config is not None)
+
+    def _load_sheet(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Final Inspection Sheet', '', 'Excel workbook (*.xlsx);;All files (*)')
+        if not path:
+            return
+        try:
+            sensors = inspection_sheet.read(file_io.read_bytes(path))
+        except (OSError, inspection_sheet.SheetError) as exc:
+            self.status.setText(str(exc))
+            set_role(self.status, 'bad')
+            return
+        sensor = sensors[0]
+        if len(sensors) > 1:
+            serials = [s['serial'] or '(no serial)' for s in sensors]
+            choice, ok = QInputDialog.getItem(self, 'OSpRad', 'The sheet lists several '
+                                              'sensors. Which one is in this unit?',
+                                              serials, 0, False)
+            if not ok:
+                return
+            sensor = sensors[serials.index(choice)]
+        self._fill(sensor['serial'], [repr(float(v)) for v in sensor['coefficients']])
+        resolution = (' Resolution %.1f nm.' % sensor['resolution']
+                      if sensor['resolution'] else '')
+        self.status.setText('Read sensor %s from the sheet.%s Check the serial matches the '
+                            'one on your sensor, then Save.' % (sensor['serial'], resolution))
+        set_role(self.status, 'muted')
+
+    def _save(self):
+        coefs = self._coefficients()
+        unit = self.config.unit_number
+        wav = calibration.hamamatsu_to_wav_coef(coefs)
+        serial = self.serial_edit.text().strip()
+        try:
+            calib = self.store.get(unit)
+        except calibration.CalibrationError:
+            calib = None
+        try:
+            if calib is None:
+                calib = calibration.new_unit(unit, wav, serial)
+                message = ('Started a calibration for unit #%d with these wavelengths. Its '
+                           'sensitivity and linearisation are placeholders from another unit '
+                           'until you measure them in the next steps.' % unit)
+            else:
+                stale = calib.set_wavelength(wav, serial)
+                message = 'Saved the wavelengths for unit #%d.' % unit
+                if stale:
+                    message += (' The %s curve was measured on the old wavelengths; derive '
+                                'it again.' % ' and '.join(
+                                    {'radSens': 'radiance', 'irrSens': 'irradiance'}[r]
+                                    for r in stale))
+            self.store.save_unit(calib)
+        except (OSError, calibration.CalibrationError) as exc:
+            self.status.setText(str(exc))
+            set_role(self.status, 'bad')
+            return
+        self.status.setText(message)
+        set_role(self.status, 'good')
+        self.unit_banner.set_config(self.config, self.store)
+        self._on_saved()
 
 
 class LinearisationTab(QWidget):
@@ -576,9 +774,8 @@ class LinearisationTab(QWidget):
             calib = self.store.get(unit_number)
         except calibration.CalibrationError:
             QMessageBox.critical(self, 'OSpRad', (
-                'Unit #%d has no calibration data yet. Add its wavelength '
-                'coefficients and sensitivity curves first, then save the '
-                'linearisation.' % unit_number))
+                'Unit #%d has no calibration yet. Load its inspection sheet in the '
+                'Wavelength step first, then save the linearisation.' % unit_number))
             return
 
         reply = QMessageBox.question(self, 'OSpRad', (
@@ -595,6 +792,7 @@ class LinearisationTab(QWidget):
         # linCoefs set the overall scale of the linearised signal. The sensitivity
         # curves are only valid for the coefficients they were derived against.
         calib.lin_coefs = coefs
+        calib.placeholders.discard('linCoefs')
         self.store.save_unit(calib)
         self.status.setText('Saved linearisation coefficients for unit #%d. Re check '
                             'the spectral sensitivity next.' % unit_number)
@@ -841,6 +1039,7 @@ class SensitivityTab(QWidget):
     def _save(self):
         calib, mode, values, vcc = self.pending
         calib.vcc_ref[mode] = vcc
+        calib.placeholders.discard('irrSens' if mode == 'i' else 'radSens')
         if mode == 'i':
             calib.irr_sens = values
         else:
@@ -1114,13 +1313,8 @@ class CosineResponseTab(QWidget):
 
 
 class CalibrationTransferTab(QWidget):
-    """Unit number, plus export/import of everything else as one JSON file.
-
-    Calibrated transfer lives here (not on the tab that produces each value) so
-    there is one obvious place to back a unit up from and restore it to. The unit
-    number sits here too: it's what ties the two halves together. CSV rows are
-    looked up by it, and it's stored on the Arduino alongside the wheel positions.
-    """
+    """Export/import of a unit's whole calibration as one JSON file, in one obvious
+    place to back a unit up from and restore it to."""
 
     def __init__(self, connection, store, log=None):
         super().__init__()
@@ -1131,22 +1325,6 @@ class CalibrationTransferTab(QWidget):
         layout = QVBoxLayout(self)
         self.unit_banner = UnitBanner()
         layout.addWidget(self.unit_banner)
-
-        unit_group = QGroupBox('Unit number')
-        unit_layout = QVBoxLayout(unit_group)
-        unit_layout.addWidget(wrapped_label(
-            'Each unit needs its own ID, used to look up its calibration data. '
-            'Stored on the Arduino.'))
-        unit_row = QHBoxLayout()
-        self.unit_number_edit = QLineEdit()
-        self.unit_number_edit.setFixedWidth(80)
-        unit_row.addWidget(self.unit_number_edit)
-        self.save_unit_button = QPushButton('Save to unit')
-        self.save_unit_button.clicked.connect(self._save_unit)
-        unit_row.addWidget(self.save_unit_button)
-        unit_row.addStretch(1)
-        unit_layout.addLayout(unit_row)
-        layout.addWidget(unit_group)
 
         select_group = QGroupBox('Include')
         select_layout = QVBoxLayout(select_group)
@@ -1186,34 +1364,15 @@ class CalibrationTransferTab(QWidget):
             self.unit_banner.set_config(config, getattr(self, 'store', None))
         else:
             self.unit_banner.set_disconnected()
-        self.save_unit_button.setEnabled(connection is not None)
-        self.unit_number_edit.setEnabled(connection is not None)
         if connection is None:
-            self.unit_number_edit.clear()
             self.status.setText(
                 'Not connected; exports cover calibration_data.csv only. The unit '
                 'number and wheel positions cannot be read or written.')
             return
         self.status.setText('')
-        if config is None:
-            try:
-                config = connection.get_config()
-            except serial_io.SpecError as exc:
-                self.status.setText(str(exc))
-                return
-        self.unit_number_edit.setText(str(config.unit_number))
 
     def _selected_fields(self):
         return [key for key, check in self.field_checks.items() if check.isChecked()]
-
-    def _save_unit(self):
-        try:
-            self.connection.set_unit_number(int(self.unit_number_edit.text()))
-        except (serial_io.SpecError, ValueError) as exc:
-            self.status.setText(str(exc))
-            return
-        self.status.setText('Unit number saved to the Arduino.')
-        self._log('Unit number set to %s.' % self.unit_number_edit.text())
 
     # export
 

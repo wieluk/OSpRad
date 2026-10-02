@@ -11,7 +11,7 @@
 #include <EEPROM.h>
 Servo myservo;
 
-#define FIRMWARE_VERSION "1.1.1"
+#define FIRMWARE_VERSION "1.2.0"
 
 
 // EEPROM layout: each *_ADDR holds one int (2 bytes).
@@ -85,8 +85,9 @@ int measureType = 0;
 
 uint16_t lineChecksum = 0; // running checksum for the current DATA line
 
-// The sensor integrates for ST high + 48 CLK (datasheet); this is those 48 CLK in us.
-unsigned long integrationTailUs = 0;
+// The sensor integrates for ST high + 48 CLK (manual 5-1). One CLK period, measured at
+// boot, turns an exposure into a whole number of clocks.
+float clkPeriodUs = 10.0;
 
 
 void loadConfig(){
@@ -210,11 +211,11 @@ void setup(){
 
   Serial.begin(115200);
   while (! Serial);
-  // Timed over 480 pulses since micros() only resolves 4us.
+  // Timed over 4800 pulses since micros() only resolves 4us.
   unsigned long t0 = micros();
-  for(int i = 0; i < 480; i++)
+  for(int i = 0; i < 4800; i++)
     clockPulse();
-  integrationTailUs = (micros() - t0) / 10;
+  clkPeriodUs = (micros() - t0) / 4800.0;
   readSpectrometer();
   resetData();
 }
@@ -228,19 +229,17 @@ void clockPulse(){
 
 void readSpectrometer(){
 
-  // Start clock cycle and set start pulse to signal start
-  digitalWrite(CLKpin, LOW);
-  delayMicroseconds(delayTime);
-  digitalWrite(CLKpin, HIGH);
-  delayMicroseconds(delayTime);
-  digitalWrite(CLKpin, LOW);
+  // Accumulation starts 1 to 4 CLK after ST rises, depending on the clocks before it
+  // (manual 5-1), so ST low and ST high both last a multiple of 4 CLK: 4 here plus
+  // 88 + 288 after ST falls, and the high period rounded to 4 below.
+  for(int i = 0; i < 4; i++)
+      clockPulse();
   digitalWrite(STpin, HIGH);
 
-  // micros(), as millis() ticks lose a random 0 to 1ms per exposure; subtraction survives wrap.
-  unsigned long stHighUs = (unsigned long) intTime * 1000UL;
-  stHighUs = (stHighUs > integrationTailUs) ? stHighUs - integrationTailUs : 0;
-  unsigned long start = micros();
-  while(micros() - start < stHighUs)
+  // Counted, not timed: the same clocks every scan at a given exposure.
+  float highClocks = (intTime * 1000.0) / clkPeriodUs - 48;
+  unsigned long n = (highClocks > 4) ? 4UL * (unsigned long)(highClocks / 4 + 0.5) : 4;
+  for(unsigned long i = 0; i < n; i++)
       clockPulse();
 
   //Set STpin to low

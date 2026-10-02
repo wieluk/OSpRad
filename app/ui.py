@@ -242,6 +242,10 @@ def collapsible_group(title, start_open=False):
     return group, QVBoxLayout(body)
 
 
+PLACEHOLDER_NAMES = {'wavCoef': 'wavelengths', 'radSens': 'radiance sensitivity',
+                     'irrSens': 'irradiance sensitivity', 'linCoefs': 'linearisation'}
+
+
 class UnitBanner(QWidget):
     """'Unit #3, firmware v3.2.1, calibrated', shown at the top of every calibration tab.
 
@@ -256,7 +260,9 @@ class UnitBanner(QWidget):
             'Wavelength, sensitivity and linearisation curves are saved per unit number '
             'in calibration_data.csv. The shutter wheel positions and the unit number '
             'itself live on the Arduino.\n\n'
-            'To change which unit number this OSpRad reports, use Calibrate \N{RIGHTWARDS ARROW} Import & export.')
+            '"Not yet measured" curves are placeholders from another unit: readings work, '
+            'but their absolute values are approximate. To change which unit number this '
+            'OSpRad reports, use Calibrate \N{RIGHTWARDS ARROW} Unit & wheel.')
 
     def __init__(self):
         super().__init__()
@@ -278,17 +284,19 @@ class UnitBanner(QWidget):
             try:
                 calib = store.get(config.unit_number)
             except Exception:
-                state = ', no calibration data yet'
+                state = ', no calibration yet (start with Wavelength)'
                 role = 'bad'
             else:
-                # A freshly installed app ships calibration for a handful of units;
-                # saying "calibrated" there would claim this hardware had been measured.
-                if getattr(calib, 'is_default', False):
-                    state = ', using default calibration'
-                    role = 'muted'
+                # Curves borrowed from another unit are not a measurement of this one.
+                borrowed = [PLACEHOLDER_NAMES[r] for r in PLACEHOLDER_NAMES
+                            if r in calib.placeholders]
+                if borrowed:
+                    state = ', not yet measured: %s' % ', '.join(borrowed)
                 else:
                     state = ', calibrated'
                     role = 'good'
+                if calib.serial:
+                    state = ', sensor %s%s' % (calib.serial, state)
         if not config.configured:
             state += ', wheel positions not saved'
             role = 'bad'

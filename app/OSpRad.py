@@ -32,7 +32,7 @@ import updates
 from _version import __version__
 from calibration_wizard import (WHEEL_ROLE_HELP, CalibrationTransferTab,
                                 CosineResponseTab, LinearisationTab,
-                                SensitivityTab, UnitSetupTab)
+                                SensitivityTab, UnitSetupTab, WavelengthTab)
 from ui import FlowLayout, captioned, collapsible_group, help_button, tip, wrapped_label
 from ui import set_role as _set_role
 from monitor_calibration import MonitorCalibrationTab
@@ -499,8 +499,8 @@ class OSpRadApp(QMainWindow):
 
     def _hardware_tabs(self):
         """The tabs that hold a connection and their own plot."""
-        return (self.unit_setup_tab, self.linearisation_tab, self.sensitivity_tab,
-                self.cosine_tab, self.transfer_tab, self.monitor_cal_tab)
+        return (self.unit_setup_tab, self.wavelength_tab, self.linearisation_tab,
+                self.sensitivity_tab, self.cosine_tab, self.transfer_tab, self.monitor_cal_tab)
 
     def _on_wide_changed(self, wide):
         self._measure_page.set_wide(wide)
@@ -1026,20 +1026,24 @@ class OSpRadApp(QMainWindow):
 
     def _build_calibration_tab(self):
         self._cal_steps = shell.StepList(
-            'One time setup per unit. Unit number and wheel positions live on the '
-            'Arduino; linearisation and spectral sensitivity live in '
-            'calibration_data.csv.', on_list_shown=self._refresh_cal_summaries)
+            'Once per unit, in this order. The unit number and wheel positions are '
+            'stored on the Arduino, the rest in calibration_data.csv.',
+            on_list_shown=self._refresh_cal_summaries)
         self._cal_steps.set_list_container(_make_scroll_tab(self._cal_steps.list_widget()))
-        self.unit_setup_tab = UnitSetupTab(self.connection, self.store)
+        self.unit_setup_tab = UnitSetupTab(self.connection, self.store,
+                                           on_unit_changed=self._connect)
+        self.wavelength_tab = WavelengthTab(self.connection, self.store,
+                                            on_saved=self._on_calibration_saved)
         self.linearisation_tab = LinearisationTab(self.connection, self.store)
         self.sensitivity_tab = SensitivityTab(self.connection, self.store)
         self.cosine_tab = CosineResponseTab(self.connection, self.store)
         self.transfer_tab = CalibrationTransferTab(self.connection, self.store, self._log)
         for title, page in (('1  Unit & wheel', self.unit_setup_tab),
-                            ('2  Linearisation', self.linearisation_tab),
-                            ('3  Spectral sensitivity', self.sensitivity_tab),
-                            ('4  Cosine response', self.cosine_tab),
-                            ('5  Import & export', self.transfer_tab)):
+                            ('2  Wavelength', self.wavelength_tab),
+                            ('3  Linearisation', self.linearisation_tab),
+                            ('4  Spectral sensitivity', self.sensitivity_tab),
+                            ('5  Cosine response', self.cosine_tab),
+                            ('6  Import & export', self.transfer_tab)):
             self._cal_steps.add(title, '', _make_scroll_tab(page))
         self._refresh_cal_summaries()
         return self._cal_steps
@@ -1059,19 +1063,27 @@ class OSpRadApp(QMainWindow):
                      '\N{MIDDLE DOT} radiance %d'
                      % (config.unit_number, config.dark, config.irr, config.rad))
         if calib is None:
-            lin = sens = 'No calibration loaded for this unit yet'
+            wavelength = 'Load the sensor\'s inspection sheet to start this unit'
+            lin = sens = 'Needs the wavelengths first'
         else:
-            lin = 'a = %.4g, b = %.4g' % tuple(calib.lin_coefs)
+            calib._derive()
+            wavelength = '%sPixel 1 to 288: %.1f to %.1f nm' % (
+                'Sensor %s \N{MIDDLE DOT} ' % calib.serial if calib.serial else '',
+                calib.wavelength[0], calib.wavelength[-1])
+            todo = ' (placeholder, not yet measured)'
+            lin = 'a = %.4g, b = %.4g%s' % (calib.lin_coefs[0], calib.lin_coefs[1],
+                                            todo if 'linCoefs' in calib.placeholders else '')
             sens = ' \N{MIDDLE DOT} '.join(
-                '%s %s' % (name, 'set' if any(v > 0 for v in values) else 'missing')
-                for name, values in (('Radiance', calib.rad_sens),
-                                     ('Irradiance', calib.irr_sens)))
-            if calib.is_default:
-                sens += ' (shipped defaults)'
-        for i, text in enumerate((wheel, lin, sens,
+                '%s %s' % (name, 'placeholder' if row in calib.placeholders else 'measured')
+                for name, row in (('Radiance', 'radSens'), ('Irradiance', 'irrSens')))
+        for i, text in enumerate((wheel, wavelength, lin, sens,
                                   'Check the diffuser\'s response against angle',
-                                  'Unit number, and backing up a calibration as one file')):
+                                  'Back up or restore a calibration as one file')):
             self._cal_steps.set_summary(i, text)
+
+    def _on_calibration_saved(self):
+        self._refresh_cal_summaries()
+        self._propagate_connection(self._config)
 
     def _build_about_page(self):
         content = QWidget()

@@ -1,242 +1,140 @@
 # OSpRad
 
-An open source, low cost, high sensitivity spectroradiometer. Built around the
-Hamamatsu C12880MA chip. Covers roughly 310 to 880 nm at about 9 nm resolution, with
-tested sensitivity down to ~0.001 cd/sqm (radiance) and ~0.005 lx (irradiance).
+An open source, low cost, high sensitivity spectroradiometer built around the
+Hamamatsu C12880MA. Covers roughly 310 to 880 nm at about 9 to 12 nm resolution, with
+tested sensitivity down to ~0.001 cd/m² (radiance) and ~0.005 lx (irradiance).
 
-A heavily modified fork of OSpRad. Free software under GPL 3.0, without warranty of
-any kind. See [License and credits](#license-and-credits).
-
-This repository holds the STL files for the housing, the Arduino Nano firmware, and a
-Python app for Windows, macOS, Linux, and Android.
+A heavily modified fork of OSpRad: housing STL files, Arduino Nano firmware, and an
+app for Windows, macOS, Linux and Android. Free software under GPL 3.0, without
+warranty of any kind.
 
 ## Get the app
 
-Prebuilt binaries are attached to each
-[release](https://github.com/wieluk/OSpRad/releases):
+Download from the [releases](https://github.com/wieluk/OSpRad/releases):
 
 | File | Platform |
 | --- | --- |
 | `OSpRad-<version>-windows-x64.exe` | Windows |
-| `OSpRad-<version>-macos-arm64.zip` | macOS, Apple Silicon (unzip to get `OSpRad.app`) |
-| `OSpRad-<version>-macos-x86_64.zip` | macOS, Intel |
-| `OSpRad-<version>-linux-x86_64.AppImage` | Linux (chmod +x, then run) |
-| `OSpRad-<version>-linux-x86_64.tar.gz` | Linux without FUSE (extract, run `OSpRad/OSpRad`) |
+| `OSpRad-<version>-macos-arm64.zip` / `-macos-x86_64.zip` | macOS, Apple Silicon / Intel (unsigned: right click → **Open** the first time) |
+| `OSpRad-<version>-linux-x86_64.AppImage` | Linux (`chmod +x`, then run; `.tar.gz` without FUSE) |
 | `OSpRad-<version>-android-arm64.apk` | Android (sideload) |
-| `osprad-<version>-py3-none-any.whl` | Any (`pip install osprad`) |
 
-Or install from PyPI:
+Or `pip install osprad`, or from a checkout: `pip install -r app/requirements.txt`
+then `python app/OSpRad.py`.
 
-```sh
-pip install osprad
-```
-
-Or run from a source checkout:
-
-```sh
-pip install -r app/requirements.txt
-python app/OSpRad.py
-```
-
-The app writes `data.csv` next to itself (or, for a `pip install` and on macOS, to a
-per user directory like `~/.local/share/OSpRad` or `~/Library/Application Support/OSpRad`).
-The macOS app is unsigned: on first launch right click it and choose **Open**. Keep `app/*.py` together with the
-`calibration_data.csv` they ship with.
+On Windows the Nano's USB serial chip (CH340 or FTDI) may need a driver. On Linux, add
+yourself to the group owning the port (`dialout`, or `uucp` on Arch) and log in again.
 
 ## Use the app
 
-Plug the OSpRad in over USB (which also powers it) and launch the app. On Windows
-you may need to install a driver for the Nano's USB serial chip (CH340 or FTDI,
-depending on the clone) if it does not show up in Device Manager. On Linux, add
-yourself to the group owning the port (`dialout`, or `uucp` on Arch) and log in again.
+Plug the OSpRad in over USB and launch the app. It has four sections: **Measure**,
+**History**, **Calibrate** and **More** (monitor calibration, updates, settings, log,
+about). The chip in the header ("Unit 1") opens the connection panel.
 
-The app has four sections: **Measure**, **History**, **Calibrate** and **More**
-(monitor calibration, settings, log, about). It looks and works the same on every
-platform; on a narrow window navigation sits at the bottom, on a wide one at the
-side. The status chip in the header ("Unit 1") opens the connection panel (port,
-reconnect, sensor check).
+**Measure** has three modes, one open at a time: **Measurement** for a single
+radiance or irradiance reading, **Continuous mode** for a live plot (nothing is
+saved), and **Automatic repeat** to save a reading every N seconds. Continuous mode
+fixes the exposure so it can reuse the dark reference, and re measures the dark
+every 30 s as the sensor warms; **Hold dark reference** skips that, for
+demonstrations only, as readings then drift too high and cannot be saved.
 
-Measure holds three modes, one open at a time. **Measurement** for a single
-Radiance or Irradiance reading, **Continuous mode** for a live, refreshing plot,
-and **Automatic repeat** to save a measurement every N seconds. Opening one folds
-the others away; the exposure, scan count, and label controls below follow
-whichever is open, so only the options that mode uses are on screen. A running mode
-keeps its section open until it is stopped.
-
-The shutter wheel is left closed whenever the OSpRad is idle. Every ordinary
-measurement ends that way by itself, since its last act is the block of dark
-scans; a continuous run and a cancelled measurement are parked once the link is
-free.
-
-Continuous mode is best for aiming the unit at a source and watching the spectrum
-follow what you point at. Nothing is saved to history. While it runs it borrows
-the measurement settings: one scan per update, and an exposure it picks and
-holds unless you have fixed one yourself. Your settings come back when it stops.
-
-Holding the exposure is what makes it quick. Firmware 1.0.0 or newer refreshes
-the plot in fractions of a second by reusing the dark reference between updates,
-but only while the exposure and scan count stay put, so an integration time left
-on 0 (auto) would re exposure ramp every update and undo it. Expect a couple of
-slow updates whenever it re exposes for a much brighter or darker target, and one
-pair of wheel movements every 30s, where the app re references the dark to follow
-the sensor warming up. On older firmware every update re takes a dark, which
-costs seconds and is mostly fine but noticeably slower.
-
-**Hold dark reference** stops that periodic re reference, so with one mode ticked
-the wheel moves only to take the first dark and then stays still for the rest of
-the run: once if it is already on the dark position (which it is straight after
-any Radiance or Irradiance measurement), twice from anywhere else, and three
-times at integration time 0, since choosing an exposure means looking at the
-scene first. It is for demonstrating and nothing else. The dark offset grows as
-the sensor warms, so a held one under subtracts and the spectrum reads gradually
-too high, worst at long exposures and on dim targets. The exposure is held with
-it, since a dark reading is only good for the exposure it was taken at and re
-exposing would mean moving the wheel to re measure it: point at something much
-brighter and the spectrum clips flat, point at something much darker and it
-sinks into the noise, and neither recovers until you untick the box. Readings
-taken while the dark was held cannot be saved to the history.
-
-The app and firmware are released together and must share a major version
-(currently 1.x). If connecting reports an unexpected reply, reflash. Firmware 1.1.0
-adds exact exposure timing and supply voltage readings; refit the linearisation
-after upgrading. `data.csv`
-files written by the original upstream 1.x app are not readable; the column
-layout changed when the firmware gained the framed reply protocol.
+App and firmware must share a major version (1.x). Readings are saved to `data.csv`
+next to the app (in a per user folder for `pip` installs and on macOS).
 
 ## Build one
 
 ### Parts
 
-- Hamamatsu C12880MA chip
+- Hamamatsu C12880MA
 - 3D printed housing (black PLA or ABS; not PET, which is IR transparent)
 - Arduino Nano
-- Cosine corrector: 8 mm diameter, 0.5 mm thick virgin PTFE, sanded circularly with 180 grit
+- Cosine corrector: 8 mm diameter, 0.5 mm thick virgin PTFE, sanded circularly with 180 grit, fixed with UV curing glue
 - Digital micro servo (Savox SH 0256 recommended)
-- A short USB cable (something like USB C to USB A female + USB A to USB mini works on a phone)
-- Solder and thin wire (10 cm lengths stripped from an old Ethernet cable are ideal)
-- UV curing glue for the PTFE diffuser
+- A short USB cable (USB C to USB A female + USB A to mini USB works on a phone)
+- Thin wire (lengths stripped from an old Ethernet cable are ideal)
 - Optional: a fused silica cover slip or UV transmitting PMMA disk for protection
 
 ### Print and assemble
 
-The 3D printed parts need filing and sanding for a snug fit. File the shutter
-wheel shaft smooth and circular, enlarge the housing hole with a circular file
-until the shaft rotates without play, and warm the shaft end with a heat gun or
-lighter flame to press fit it onto the servo while the plastic is flexible.
+The printed parts need filing for a snug fit. File the shutter wheel shaft smooth and
+round, open the housing hole with a round file until the shaft turns without play,
+and warm the shaft end to press fit it onto the servo.
 
 ![image](https://user-images.githubusercontent.com/53558556/206735271-c7213dae-bb6c-4bfd-b26a-0d071d12910c.png)
 
 ### Wire it up
 
-Use separate 5 V supplies for the servo and spectrometer chip. The VIN pin
-suffers a voltage drop from its protective diode, leaving it just a touch under
-what the spectrometer needs for stable operation.
+Use separate 5 V supplies for the servo and the sensor: the VIN pin's protective diode
+leaves it just under what the sensor needs. Keep the video wire short and away from
+the clock wires.
 
 ![Circuit Diagram](https://user-images.githubusercontent.com/53558556/206735133-19c5051f-9946-49dd-95c0-88d3e2ee12a0.png)
 
-### Flash and set up
+### Flash the firmware
 
-Plug the Nano in, launch the app and use **More → Updates → Flash**, which writes
-the firmware the app was released with (no Arduino IDE needed, on any platform).
-The Arduino IDE works too: open `firmware/OSpRad_firmware/` and upload it. The unit
-number and wheel positions live in EEPROM and are set from the app, so the same
-firmware goes on every unit, and reflashing keeps them.
-
-1. Flash, connect over USB, and launch the app.
-2. **Calibrate → Import & export**: enter the unit number (each unit needs its
-   own ID to look up its calibration data) and press **Save to unit**.
-3. **Calibrate → Unit & wheel**: move the wheel to 90 degrees with the slider, remove
-   it from the servo at that central position, and re attach it as close to
-   "closed" as possible.
-4. Jog the slider (or the +/- buttons) to find each position in turn. Press
-   **Set as Dark**, **Set as Irradiance**, and **Set as Radiance** as each one
-   lines up.
-
-## Updates
-
-**More → Updates** compares the installed app and the unit's firmware with the
-latest GitHub release, and checks once a day at startup (untick to stop it).
-
-- **Update** replaces the app in place when it is a Linux AppImage or the Windows
-  `.exe`, after checking the download against the release's `SHA256SUMS.txt`; restart
-  to use it. Elsewhere it opens the right download in your browser (macOS, Android,
-  the Linux tarball) or shows the `pip` command.
-- **Flash** writes the firmware bundled with the app; **Flash latest from GitHub**
-  the release's `OSpRad-firmware-<version>.hex`; **Flash a .hex file...** your own
-  build from the Arduino IDE (*Sketch → Export Compiled Binary*). **View source**
-  shows the bundled firmware's code. Flashing takes about 15 seconds and keeps the
-  unit number and wheel positions; if it is interrupted, just flash again.
+In the app, **More → Updates → Flash** writes the firmware it was released with, on
+any platform; the Arduino IDE works too (`firmware/OSpRad_firmware/`). The unit number
+and wheel positions live in EEPROM, so reflashing keeps them. **Updates** also checks
+GitHub for new app and firmware versions, can flash a `.hex` file of your own, and
+replaces the AppImage or `.exe` in place.
 
 ## Calibrate it
 
-Each unit's calibration lives in `calibration_data.csv`, four comma delimited
-rows per unit, keyed by the unit number in the first column.
+Every C12880MA differs: by several nm in wavelength and by tens of percent in
+sensitivity. **Calibrate** walks through it once per unit, in order:
 
-![image](https://user-images.githubusercontent.com/53558556/206896550-cf35ebd2-01a4-46ef-b638-2797bc92ab76.png)
+1. **Unit & wheel.** A new unit reports number 1, which is the calibration the app
+   ships, so give yours another number and **Save to unit**. Then set the shutter
+   wheel: move it to 90 degrees, refit it on the servo as close to closed as possible,
+   and press **Set as Dark**, **Set as Irradiance** and **Set as Radiance** as each
+   position lines up.
+2. **Wavelength.** Hamamatsu measures every sensor and lists its coefficients A0 to B5
+   on a *Final Inspection Sheet*, on the CD-ROM in the sensor's box (folder
+   `C12880MA_<order number>`, file `C12880MA FINAL INSPECTION SHEET_....xlsx`).
+   **Load inspection sheet...** and pick it, or type the six numbers as printed. Check
+   its serial number matches the one on your sensor; if the sheet is lost, ask the
+   seller or Hamamatsu for it. A unit without calibration starts one here; its
+   sensitivity and linearisation are placeholders until steps 3 and 4.
+3. **Linearisation.** Point it at a steady, non flickering light (daylight on a white
+   wall, or a halogen bulb; most LED and fluorescent lights flicker) and run it.
+4. **Spectral sensitivity**, for radiance and irradiance. Best: measure a steady lamp
+   with a calibrated spectroradiometer and with the OSpRad, and load the reference
+   spectrum. Otherwise rescale to a known reading (a lux meter), which corrects the
+   overall level only.
+5. **Cosine response** checks the irradiance diffuser against angle.
+6. **Import & export** backs a unit's whole calibration up as one file.
 
-The **Calibrate** section of the app covers most of this and writes straight into
-the CSV:
+Calibration is stored in `calibration_data.csv`, rows keyed by unit number. The app
+ships unit 1, the maintainers' unit: its wavelengths are its own (its inspection sheet
+is in [docs/](docs/), names and serial removed), its sensitivity and linearisation are
+still placeholders from the original author's unit. The sensor's manual is in
+[docs/](docs/) too.
 
-- **Linearisation** fits linCoefs from one steady source (daylight or
-  incandescent; most LED and fluorescent lighting flickers). The coefficients
-  set the overall scale, so re derive or rescale the spectral sensitivity
-  afterwards.
-- **Spectral sensitivity**: load a 288 value curve from a file, rescale against
-  one known reading, or derive a new one from a reference spectrum. Nothing is
-  written until **Save**.
-- **Import & export** saves or restores a unit's whole calibration (CSV plus
-  wheel positions on the Arduino) as one JSON file. Tick boxes select what to
-  include; an import merges into the unit rather than replacing it.
+## Measuring well
 
-The spreadsheets in `calibration/` document the full derivation for reference.
-
-The Nano's ADC measures against its USB supply, so readings scale with 1/Vcc. With
-firmware 1.1.0, a sensitivity saved from the app stores the supply it was measured
-at (the optional `vccRef` row, radiance and irradiance in mV) and later readings are
-scaled back to it. Older calibrations stay uncorrected until re saved.
+- **Let it warm up** a few minutes before calibrating or measuring dim scenes:
+  sensitivity and dark current change with temperature.
+- **Avoid saturation**, which clips the peak and reads too low. The shortest exposure
+  is 1 ms; for the sun or a bare lamp up close, use a neutral density filter.
+- **Resolution** is 9 to 15 nm: narrower lines read that wide, with a lower peak.
+- **Range** is 340 to 850 nm. Window glass blocks most UV.
+- **Dim scenes** have a floor of about ±0.03 cd/m² at 1 s exposures; longer exposures
+  lower it.
 
 ## Calibrate a monitor
 
-**More → Monitor calibration** steps a fullscreen patch through black, then through a
-ladder of levels for each of red, green, and blue, measuring the spectrum at
-every step (point the unit at the screen in Radiance mode). **Export for
-Psychtoolbox...** writes a fitted PsychCal `.mat` file that loads with
-`cal = LoadCalFile(...)`, no MATLAB side step needed. See
-[monitor_calibration.py](app/monitor_calibration.py)'s header for the model and
-tone curve choices; `cal.describe.gamma.fitType` says `OSpRad pchip` so the
-difference from PTB's pipeline is visible rather than implied away.
-
-Calibrate in as dark a room as practical. The black screen, measured before and
-after the sweep, is subtracted before fitting, as Psychtoolbox does.
-
-## For developers
-
-The Python app lives in `app/`, the Arduino sketch in `firmware/`, and the build
-scripts in `packaging/`. After changing the sketch, regenerate the firmware the app
-bundles with `python packaging/generate_bundled_firmware.py` (needs arduino-cli with
-`arduino:avr@1.8.8` and `Servo@1.3.0`); CI fails if it is out of date. Desktop builds use PyInstaller; Windows and macOS must
-be built on their own OS, since PyInstaller does not cross compile. Android
-builds use `pyside6-android-deploy` and take 20 to 40+ minutes on a clean
-checkout.
-
-`[.github/workflows/package.yml](.github/workflows/package.yml)` runs the checks,
-builds every platform, attaches the artifacts to a GitHub Release, and publishes
-the wheel to PyPI.
+**More → Monitor calibration** steps a fullscreen patch through black and a ladder of
+levels for red, green and blue, measuring each (radiance mode, pointed at the screen),
+and **Export for Psychtoolbox...** writes a PsychCal `.mat` file for
+`cal = LoadCalFile(...)`. Work in a dark room; the black screen is subtracted as
+Psychtoolbox does.
 
 ## License and credits
 
-OSpRad is free software under the GNU General Public License v3.0 (see `LICENSE`),
-and comes with no warranty of any kind.
+GNU General Public License v3.0 (see `LICENSE`), no warranty of any kind. Original
+OSpRad by Jolyon Troscianko, 2022 ([troscianko/OSpRad](https://github.com/troscianko/OSpRad));
+forked and heavily modified in 2026.
 
-Original OSpRad by Jolyon Troscianko, 2022
-([troscianko/OSpRad](https://github.com/troscianko/OSpRad)). This repository
-started as a fork and has since been heavily modified (2026); it is now
-maintained as a standalone project.
-
-## Citation
-
-If you use OSpRad in published work, please cite the original release:
-
-Troscianko, J. (2023) OSpRad: an open-source, low-cost, high-sensitivity
-spectroradiometer. *Journal of Experimental Biology*.
-<https://doi.org/10.1242/jeb.245416>
+If you use OSpRad in published work, please cite: Troscianko, J. (2023) OSpRad: an
+open-source, low-cost, high-sensitivity spectroradiometer. *Journal of Experimental
+Biology*. <https://doi.org/10.1242/jeb.245416>
