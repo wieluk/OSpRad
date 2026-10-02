@@ -18,7 +18,7 @@ import logging
 import time
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+from PySide6.QtWidgets import (QLabel, QLineEdit, QMessageBox,
                                QPushButton, QVBoxLayout, QWidget)
 
 import numpy as np
@@ -28,7 +28,7 @@ import file_io
 import plotting
 import serial_io
 from calibration_wizard import WHEEL_MAX_ANGLE, WHEEL_MIN_ANGLE
-from ui import UnitBanner, help_button, tip, wrapped_label
+from ui import FlowLayout, UnitBanner, help_button, tip, wrapped_label
 from qt_worker import Worker
 
 # Default Psychtoolbox wavelength sampling spec S = [startWL, deltaWL, numWL],
@@ -224,7 +224,7 @@ class MonitorCalibrationTab(QWidget):
             'CalibrateMonSpd. Takes a few minutes; each step needs a moment to '
             'auto expose (longer for dim levels).'))
 
-        settings = QHBoxLayout()
+        settings = FlowLayout()
         levels_label = QLabel('Levels per channel')
         settings.addWidget(levels_label)  # '?' added below, once levels_tip exists
         self.n_levels_edit = QLineEdit('11')
@@ -251,7 +251,7 @@ class MonitorCalibrationTab(QWidget):
         settings.addStretch(1)
         layout.addLayout(settings)
 
-        btn_row = QHBoxLayout()
+        btn_row = FlowLayout()
         self.start_button = QPushButton('Start')
         self.start_button.clicked.connect(self._start)
         btn_row.addWidget(self.start_button)
@@ -332,7 +332,7 @@ class MonitorCalibrationTab(QWidget):
         except calibration.CalibrationError:
             QMessageBox.critical(self, 'OSpRad', (
                 'Unit #%d has no wavelength/sensitivity/linearisation calibration '
-                'in %s yet. Finish device calibration (Calibration tab) before '
+                'in %s yet. Finish device calibration (Calibrate) before '
                 'measuring a monitor with it.' % (config.unit_number, self.store.path)))
             return
 

@@ -27,8 +27,8 @@ def _superscript(value):
     return ''.join(_SUPERSCRIPT.get(ch, ch) for ch in str(value))
 
 # 'muted' matches the app's muted label role: readable, but clearly secondary.
-LIGHT = {'bg': '#fafafa', 'fg': '#1c1c1c', 'grid': '#c8c8c8', 'muted': '#6a6a6a'}
-DARK = {'bg': '#1c1c1c', 'fg': '#fafafa', 'grid': '#4a4a4a', 'muted': '#9a9a9a'}
+LIGHT = {'bg': '#f5f5f8', 'fg': '#111111', 'grid': '#dcdce2', 'muted': '#8e8e93'}
+DARK = {'bg': '#1c1c1e', 'fg': '#f2f2f7', 'grid': '#3a3a3c', 'muted': '#8e8e93'}
 
 # The spectral gradient only reads sensibly for a single curve, so overlays get a
 # plain line cycling through this list.
@@ -125,8 +125,9 @@ class SpectrumPlot:
         c = self.colors
         self.figure.set_facecolor(c['bg'])
         self.ax.set_facecolor(c['bg'])
-        for spine in self.ax.spines.values():
+        for name, spine in self.ax.spines.items():
             spine.set_color(c['grid'])
+            spine.set_visible(name == 'bottom')
         self.ax.tick_params(colors=c['fg'], labelsize=9)
         self.ax.xaxis.label.set_color(c['fg'])
         self.ax.yaxis.label.set_color(c['fg'])
@@ -160,7 +161,7 @@ class SpectrumPlot:
         sub_lines = self._wrap_header(subtitle, 8) if subtitle else []
         title_lines = self._wrap_header(title, 11, bold=True) if title else []
         self.ax.set_title('\n'.join(title_lines), loc='left', fontsize=11,
-                          fontweight='bold', color=self.colors['fg'],
+                          fontweight='semibold', color=self.colors['fg'],
                           pad=6 + 11 * len(sub_lines))
         if sub_lines:
             self.ax.text(0.0, 1.015, '\n'.join(sub_lines), transform=self.ax.transAxes,

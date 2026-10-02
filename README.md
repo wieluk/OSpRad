@@ -50,7 +50,13 @@ you may need to install a driver for the Nano's USB serial chip (CH340 or FTDI,
 depending on the clone) if it does not show up in Device Manager. On Linux, add
 yourself to the group owning the port (`dialout`, or `uucp` on Arch) and log in again.
 
-The main tab holds three modes, one open at a time. **Measurement** for a single
+The app has four sections: **Measure**, **History**, **Calibrate** and **More**
+(monitor calibration, settings, log, about). It looks and works the same on every
+platform; on a narrow window navigation sits at the bottom, on a wide one at the
+side. The status chip in the header ("Unit 1") opens the connection panel (port,
+reconnect, sensor check).
+
+Measure holds three modes, one open at a time. **Measurement** for a single
 Radiance or Irradiance reading, **Continuous mode** for a live, refreshing plot,
 and **Automatic repeat** to save a measurement every N seconds. Opening one folds
 the others away; the exposure, scan count, and label controls below follow
@@ -130,19 +136,36 @@ what the spectrometer needs for stable operation.
 
 ### Flash and set up
 
-Open `firmware/OSpRad_firmware/` in the Arduino IDE and flash it to the Nano. The
-unit number and wheel positions live in EEPROM and are set from the app, so the
-same firmware goes on every unit. Each unit only needs flashing once.
+Plug the Nano in, launch the app and use **More → Updates → Flash**, which writes
+the firmware the app was released with (no Arduino IDE needed, on any platform).
+The Arduino IDE works too: open `firmware/OSpRad_firmware/` and upload it. The unit
+number and wheel positions live in EEPROM and are set from the app, so the same
+firmware goes on every unit, and reflashing keeps them.
 
 1. Flash, connect over USB, and launch the app.
-2. **Calibration → Import & export**: enter the unit number (each unit needs its
+2. **Calibrate → Import & export**: enter the unit number (each unit needs its
    own ID to look up its calibration data) and press **Save to unit**.
-3. **Unit & wheel setup**: move the wheel to 90 degrees with the slider, remove
+3. **Calibrate → Unit & wheel**: move the wheel to 90 degrees with the slider, remove
    it from the servo at that central position, and re attach it as close to
    "closed" as possible.
 4. Jog the slider (or the +/- buttons) to find each position in turn. Press
    **Set as Dark**, **Set as Irradiance**, and **Set as Radiance** as each one
    lines up.
+
+## Updates
+
+**More → Updates** compares the installed app and the unit's firmware with the
+latest GitHub release, and checks once a day at startup (untick to stop it).
+
+- **Update** replaces the app in place when it is a Linux AppImage or the Windows
+  `.exe`, after checking the download against the release's `SHA256SUMS.txt`; restart
+  to use it. Elsewhere it opens the right download in your browser (macOS, Android,
+  the Linux tarball) or shows the `pip` command.
+- **Flash** writes the firmware bundled with the app; **Flash latest from GitHub**
+  the release's `OSpRad-firmware-<version>.hex`; **Flash a .hex file...** your own
+  build from the Arduino IDE (*Sketch → Export Compiled Binary*). **View source**
+  shows the bundled firmware's code. Flashing takes about 15 seconds and keeps the
+  unit number and wheel positions; if it is interrupted, just flash again.
 
 ## Calibrate it
 
@@ -151,7 +174,7 @@ rows per unit, keyed by the unit number in the first column.
 
 ![image](https://user-images.githubusercontent.com/53558556/206896550-cf35ebd2-01a4-46ef-b638-2797bc92ab76.png)
 
-The **Calibration** tab in the app covers most of this and writes straight into
+The **Calibrate** section of the app covers most of this and writes straight into
 the CSV:
 
 - **Linearisation** fits linCoefs from one steady source (daylight or
@@ -174,7 +197,7 @@ scaled back to it. Older calibrations stay uncorrected until re saved.
 
 ## Calibrate a monitor
 
-**Monitor calibration** steps a fullscreen patch through black, then through a
+**More → Monitor calibration** steps a fullscreen patch through black, then through a
 ladder of levels for each of red, green, and blue, measuring the spectrum at
 every step (point the unit at the screen in Radiance mode). **Export for
 Psychtoolbox...** writes a fitted PsychCal `.mat` file that loads with
@@ -189,7 +212,9 @@ after the sweep, is subtracted before fitting, as Psychtoolbox does.
 ## For developers
 
 The Python app lives in `app/`, the Arduino sketch in `firmware/`, and the build
-scripts in `packaging/`. Desktop builds use PyInstaller; Windows and macOS must
+scripts in `packaging/`. After changing the sketch, regenerate the firmware the app
+bundles with `python packaging/generate_bundled_firmware.py` (needs arduino-cli with
+`arduino:avr@1.8.8` and `Servo@1.3.0`); CI fails if it is out of date. Desktop builds use PyInstaller; Windows and macOS must
 be built on their own OS, since PyInstaller does not cross compile. Android
 builds use `pyside6-android-deploy` and take 20 to 40+ minutes on a clean
 checkout.

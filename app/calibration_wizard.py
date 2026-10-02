@@ -21,8 +21,8 @@ import file_io
 import plotting
 import serial_io
 # Re exported: these used to live here, and other modules import them from here.
-from ui import (UnitBanner, captioned, collapsible_group, help_button,  # noqa: F401
-                set_role, tip, wrapped_label)
+from ui import (FlowLayout, UnitBanner, captioned, collapsible_group,  # noqa: F401
+                help_button, set_role, tip, wrapped_label)
 
 log = logging.getLogger('osprad.calibration_wizard')
 
@@ -140,7 +140,7 @@ class UnitSetupTab(QWidget):
         layout.addWidget(wrapped_label(
             'Set this unit\'s shutter wheel positions. Stored on the Arduino, so '
             'this only needs doing once per unit (no reflashing). The unit number '
-            'lives on the Import & export tab.'))
+            'lives on the Import & export step.'))
 
         self.config_label = wrapped_label('')
         layout.addWidget(self.config_label)
@@ -330,7 +330,7 @@ class LinearisationTab(QWidget):
             'still. The wizard measures across a range of integration times and '
             'fits the curve so doubling exposure doubles the reported signal.'))
 
-        controls = QHBoxLayout()
+        controls = FlowLayout()
         mode_label = QLabel('Measure:')
         mode_tip = ('Which quantity the sweep measures. Pick one, then press Run '
                     'measurements.\n\n'
@@ -586,7 +586,7 @@ class LinearisationTab(QWidget):
             'Old: a = %.5f, b = %.5f\nNew: a = %.5f, b = %.5f\n\n'
             'Measurements are scaled by these coefficients, so afterwards you '
             'should re derive the spectral sensitivity, or rescale it against a '
-            'known reading on the Spectral sensitivity tab.'
+            'known reading on the Spectral sensitivity step.'
             % (unit_number, calib.lin_coefs[0], calib.lin_coefs[1], coefs[0], coefs[1])),
             QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
         if reply != QMessageBox.StandardButton.Ok:
@@ -650,7 +650,7 @@ class SensitivityTab(QWidget):
             'only corrects its overall level: measure a source whose luminance '
             '(cd/sqm) or illuminance (lux) you already know, and enter that value '
             'here.'))
-        rescale_row = QHBoxLayout()
+        rescale_row = FlowLayout()
         rescale_row.addWidget(QLabel('Known value'))
         self.reference_value_edit = QLineEdit()
         self.reference_value_edit.setFixedWidth(100)
@@ -670,7 +670,7 @@ class SensitivityTab(QWidget):
             'light source as a two column file (wavelength in nm, then W/(sr*sqm*nm) '
             'for radiance or W/(sqm*nm) for irradiance). The OSpRad measures the same '
             'source and the ratio gives its spectral sensitivity.'))
-        derive_row = QHBoxLayout()
+        derive_row = FlowLayout()
         derive_row.addWidget(QLabel('Smoothing sigma'))
         self.sigma_edit = QLineEdit('2')
         self.sigma_edit.setFixedWidth(50)
@@ -958,10 +958,10 @@ class CosineResponseTab(QWidget):
             'Consistent under response at high angles is the classic failure mode '
             '(tape too thick, or shadowed by the housing).'))
 
-        picker = QHBoxLayout()
+        picker = QVBoxLayout()
         self.diagram = _AngleDiagram()
-        picker.addWidget(self.diagram)
-        preset_grid = QGridLayout()
+        picker.addWidget(self.diagram, 0, Qt.AlignmentFlag.AlignHCenter)
+        preset_grid = FlowLayout()
         self._preset_buttons = []
         for i, (angle, label) in enumerate(self.PRESET_ANGLES):
             r, c = divmod(i, 4)
@@ -969,11 +969,10 @@ class CosineResponseTab(QWidget):
             btn.clicked.connect(lambda checked=False, a=angle: self._set_angle(a))
             preset_grid.addWidget(btn, r, c)
             self._preset_buttons.append(btn)
-        picker.addLayout(preset_grid)
-        picker.addStretch(1)
+        picker.addLayout(preset_grid, 1)
         layout.addLayout(picker)
 
-        entry_row = QHBoxLayout()
+        entry_row = FlowLayout()
         entry_row.addWidget(QLabel('Angle (degrees)'))
         self.angle_edit = QLineEdit('0')
         self.angle_edit.setFixedWidth(60)

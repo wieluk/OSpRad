@@ -5,14 +5,21 @@ from PySide6.QtCore import QThread, Signal
 
 
 class Worker(QThread):
+    # Callers drop their reference in the finished slot, which can run before the
+    # thread has fully exited; destroying a running QThread aborts the app.
+    _alive = set()
+
     succeeded = Signal(object)
     failed = Signal(str)
+    progress = Signal(int, int)  # done, total; emitted by fn through its progress callback
 
     def __init__(self, fn, *args, **kwargs):
         super().__init__()
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
+        Worker._alive.add(self)
+        self.finished.connect(lambda: Worker._alive.discard(self))
 
     def run(self):
         try:

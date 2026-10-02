@@ -104,22 +104,18 @@ jobs:
 
       # arduino-cli only accepts a sketch whose .ino sits in a folder of the same
       # name, which the flat firmware/ layout is not - so stage one to compile.
-      - name: Stage the sketch
-        run: |
-          mkdir -p /tmp/sketch/OSpRad_firmware
-          cp firmware/OSpRad_firmware.ino /tmp/sketch/OSpRad_firmware/
-
-      - name: Compile the firmware
-        uses: arduino/compile-sketches@v1.1.3
+      - uses: arduino/setup-arduino-cli@v2.0.0
         with:
-          fqbn: arduino:avr:nano
-          platforms: |
-            - name: arduino:avr
-              version: 1.8.8
-          sketch-paths: /tmp/sketch/OSpRad_firmware
-          libraries: |
-            - name: Servo
-              version: 1.3.0
+          version: 1.x  # the AVR core pinned below fixes the compiler
+
+      # Compiles the sketch and fails if app/_firmware_bundled.py, the firmware the
+      # app flashes, no longer matches it.
+      - name: Compile the firmware and check the bundled copy
+        run: |
+          arduino-cli core update-index
+          arduino-cli core install arduino:avr@1.8.8
+          arduino-cli lib install Servo@1.3.0
+          python packaging/generate_bundled_firmware.py --check
 
       - name: Version consistency
         run: python packaging/check_versions.py
@@ -400,6 +396,22 @@ jobs:
         run: |
           ls -la artifacts
           [ -n "$(ls -A artifacts 2>/dev/null)" ] || { echo "nothing was built"; exit 1; }
+
+      - uses: actions/checkout@v7.0.1
+        with:
+          path: src
+
+      # The app's update page looks for these two by name.
+      - name: Add the firmware and checksums
+        run: |
+          python3 - <<'PY'
+          import sys
+          sys.path.insert(0, 'src/app')
+          import _firmware_bundled as fw
+          with open('artifacts/OSpRad-firmware-%s.hex' % fw.VERSION, 'w') as f:
+              f.write(fw.HEX_TEXT)
+          PY
+          cd artifacts && sha256sum -- * > SHA256SUMS.txt && cat SHA256SUMS.txt
 
       - uses: softprops/action-gh-release@v3.0.2
         with:

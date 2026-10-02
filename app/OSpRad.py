@@ -8,14 +8,14 @@ import shutil
 import sys
 import time
 
-from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QIcon, QPixmap, QTextCursor
+from PySide6.QtCore import QObject, QRect, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QGuiApplication, QIcon, QPixmap, QTextCursor
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFrame,
                                QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
                                QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit,
                                QPushButton, QScrollArea, QScroller, QScrollerProperties,
-                               QSizePolicy, QTabWidget, QTreeWidget, QTreeWidgetItem,
-                               QVBoxLayout, QWidget)
+                               QStyle, QStyledItemDelegate, QToolButton, QTreeWidget,
+                               QTreeWidgetItem, QVBoxLayout, QWidget)
 
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT
 
@@ -25,15 +25,19 @@ import datalog
 import file_io
 import plotting
 import serial_io
+import shell
+import theme
 import touch
+import updates
 from _version import __version__
 from calibration_wizard import (WHEEL_ROLE_HELP, CalibrationTransferTab,
                                 CosineResponseTab, LinearisationTab,
                                 SensitivityTab, UnitSetupTab)
-from ui import captioned, collapsible_group, help_button, tip, wrapped_label
+from ui import FlowLayout, captioned, collapsible_group, help_button, tip, wrapped_label
 from ui import set_role as _set_role
 from monitor_calibration import MonitorCalibrationTab
 from qt_worker import Worker, wait_for
+from updates_page import UpdatesPage
 
 
 def _user_data_dir():
@@ -153,7 +157,7 @@ class _LogBridge(QObject):
 
 
 class _QtLogHandler(logging.Handler):
-    """Feeds stdlib log records into the Debug tab through _LogBridge."""
+    """Feeds stdlib log records into the Log page through _LogBridge."""
 
     def __init__(self, bridge):
         super().__init__()
@@ -165,53 +169,10 @@ class _QtLogHandler(logging.Handler):
         self._bridge.message.emit(record.getMessage(),
                                   'error' if level == 'critical' else level)
 
-# Hand rolled replacement for sv_ttk (Tkinter only); "role" colours match the old styles.
-# (Qt stylesheet syntax: the .in py form below is a single big string.)
-LIGHT_QSS = """
-QWidget { background-color: #fafafa; color: #1c1c1c; }
-QLineEdit, QPlainTextEdit, QTreeWidget, QComboBox { background-color: #ffffff; }
-QLabel[role="muted"] { color: #7a7a7a; }
-QLabel[role="good"] { color: #2a9d8f; }
-QLabel[role="bad"] { color: #d1495b; }
-QPushButton { background-color: #e6e6e6; border: 1px solid #a0a0a0;
-    border-radius: 4px; padding: 4px 12px; }
-QPushButton:hover { background-color: #dcdcdc; }
-QPushButton:pressed { background-color: #cfcfcf; }
-QPushButton:disabled { color: #a8a8a8; border-color: #d0d0d0; }
-QCheckBox::indicator, QRadioButton::indicator, QGroupBox::indicator {
-    width: 13px; height: 13px; border: 1px solid #7a7a7a; background-color: #ffffff; }
-QRadioButton::indicator { border-radius: 7px; }
-QCheckBox::indicator, QGroupBox::indicator { border-radius: 3px; }
-QCheckBox::indicator:checked, QRadioButton::indicator:checked,
-QGroupBox::indicator:checked { background-color: #2a9d8f; border-color: #2a9d8f; }
-QCheckBox::indicator:disabled, QRadioButton::indicator:disabled,
-QGroupBox::indicator:disabled { border-color: #d0d0d0; }
-"""
-DARK_QSS = """
-QWidget { background-color: #1c1c1c; color: #fafafa; }
-QLineEdit, QPlainTextEdit, QTreeWidget, QComboBox { background-color: #2b2b2b; color: #fafafa; }
-QLabel[role="muted"] { color: #9a9a9a; }
-QLabel[role="good"] { color: #2a9d8f; }
-QLabel[role="bad"] { color: #d1495b; }
-QPushButton { background-color: #3a3a3a; border: 1px solid #6a6a6a;
-    border-radius: 4px; padding: 4px 12px; color: #fafafa; }
-QPushButton:hover { background-color: #454545; }
-QPushButton:pressed { background-color: #2f2f2f; }
-QPushButton:disabled { color: #6a6a6a; border-color: #4a4a4a; }
-QCheckBox::indicator, QRadioButton::indicator, QGroupBox::indicator {
-    width: 13px; height: 13px; border: 1px solid #8a8a8a; background-color: #2b2b2b; }
-QRadioButton::indicator { border-radius: 7px; }
-QCheckBox::indicator, QGroupBox::indicator { border-radius: 3px; }
-QCheckBox::indicator:checked, QRadioButton::indicator:checked,
-QGroupBox::indicator:checked { background-color: #2a9d8f; border-color: #2a9d8f; }
-QCheckBox::indicator:disabled, QRadioButton::indicator:disabled,
-QGroupBox::indicator:disabled { border-color: #4a4a4a; }
-"""
-
-
 # QSettings keys. Nothing used to persist, so every launch started light themed
 # at log level "info" with the port re detected from scratch.
-SETTING_DARK_MODE = 'ui/dark_mode'
+SETTING_DARK_MODE = 'ui/dark_mode'  # pre 1.1 boolean, read once to seed SETTING_THEME
+SETTING_THEME = 'ui/theme'
 SETTING_LOG_LEVEL = 'log/level'
 SETTING_PORT = 'serial/preferred_port'
 SETTING_MEASURE_TIMEOUT = 'serial/measure_timeout'
@@ -265,7 +226,9 @@ class _MeasureOutcome:
         self.pushed_scans = pushed_scans
 
 
-COL_WHEN, COL_LABEL, COL_MODE, COL_LUMINANCE = range(4)
+COL_WHEN, COL_LABEL, COL_MODE, COL_LUMINANCE, COL_MENU = range(5)
+UPDATES_ROW = 3  # index of Updates in the More list
+MENU_GLYPH = '\N{MIDLINE HORIZONTAL ELLIPSIS}'  # tapped to open a reading's actions
 
 
 class _ReadingItem(QTreeWidgetItem):
@@ -309,23 +272,34 @@ def _make_scroll_tab(content):
     return scroll
 
 
-class _PlotToolbar(NavigationToolbar2QT):
-    """The matplotlib toolbar without its Save button.
+class _TwoLineDelegate(QStyledItemDelegate):
+    """History rows: the label, with date and mode underneath in muted text."""
 
-    Its save calls figure.savefig(path) directly, which cannot write to an Android
-    content:// URI and so produced 0 byte files there. The app's own "Save figure..."
-    goes through file_io. Filtering by name rather than index so a matplotlib
-    update that reorders the toolbar cannot silently drop the wrong tool.
-    """
-    toolitems = [item for item in NavigationToolbar2QT.toolitems if item[0] != 'Save']
+    def sizeHint(self, option, index):
+        size = super().sizeHint(option, index)
+        return QSize(size.width(), size.height() * 2)
 
-
-def _fit_width(widget):
-    """Let a widget be squeezed below its natural width instead of forcing the whole
-    tab wider than the screen. Used for the matplotlib toolbars, whose row of buttons
-    is wider than a phone in portrait."""
-    widget.setSizePolicy(QSizePolicy.Policy.Ignored, widget.sizePolicy().verticalPolicy())
-    return widget
+    def paint(self, painter, option, index):
+        self.initStyleOption(option, index)
+        option.text = ''
+        style = option.widget.style() if option.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, option, painter, option.widget)
+        rect = option.rect.adjusted(8, 4, -4, -4)
+        top = QRect(rect.left(), rect.top(), rect.width(), rect.height() // 2)
+        bottom = QRect(rect.left(), rect.top() + rect.height() // 2, rect.width(),
+                       rect.height() // 2)
+        mode = index.siblingAtColumn(COL_MODE).data()
+        second = '%s \N{MIDDLE DOT} %s' % (index.siblingAtColumn(COL_WHEN).data(),
+                                             {'r': 'Radiance', 'i': 'Irradiance'}.get(mode, mode))
+        painter.save()
+        painter.setPen(option.palette.color(option.palette.ColorRole.Text))
+        metrics = option.fontMetrics
+        painter.drawText(top, Qt.AlignmentFlag.AlignVCenter,
+                         metrics.elidedText(index.data(), Qt.TextElideMode.ElideRight, top.width()))
+        painter.setPen(option.palette.color(option.palette.ColorRole.PlaceholderText))
+        painter.drawText(bottom, Qt.AlignmentFlag.AlignVCenter,
+                         metrics.elidedText(second, Qt.TextElideMode.ElideRight, bottom.width()))
+        painter.restore()
 
 
 class OSpRadApp(QMainWindow):
@@ -341,7 +315,11 @@ class OSpRadApp(QMainWindow):
 
         # Read before _build_ui: the plots are constructed with dark=self.dark_mode, so
         # restoring the theme afterwards would leave them on the wrong palette.
-        self.dark_mode = _get_setting(SETTING_DARK_MODE, False, bool)
+        self.theme_mode = _get_setting(
+            SETTING_THEME, 'dark' if _get_setting(SETTING_DARK_MODE, False, bool) else 'system')
+        if self.theme_mode not in theme.MODES:
+            self.theme_mode = 'system'
+        self.dark_mode = theme.is_dark(self.theme_mode)
         # Held here rather than read off a widget: _log runs before the Settings tab
         # exists, and during shutdown after it is gone.
         self._log_level = _get_setting(SETTING_LOG_LEVEL, 'info')
@@ -400,6 +378,9 @@ class OSpRadApp(QMainWindow):
         self._sections = {}
         self._section_switching = False
         self._connect_worker = None
+        self._config = None
+        self._connecting = False
+        self._unit_text = ''
         self._connect_port = None
         self._measure_worker = None
         self._measure_done = None
@@ -425,18 +406,36 @@ class OSpRadApp(QMainWindow):
         self._build_ui()
         self._install_log_bridge()
         self._apply_theme()
+        QGuiApplication.styleHints().colorSchemeChanged.connect(
+            lambda _: self._apply_theme() if self.theme_mode == 'system' else None)
         self._load_saved_readings()
         QTimer.singleShot(100, self._connect)
+        updates.remove_leftovers()
+        QTimer.singleShot(3000, self.updates_page.check_on_start)
 
     def _build_ui(self):
-        tabs = QTabWidget()
-        self.setCentralWidget(tabs)
-        tabs.addTab(_make_scroll_tab(self._build_main_tab()), 'Main')
-        tabs.addTab(_make_scroll_tab(self._build_history_tab()), 'History')
-        tabs.addTab(_make_scroll_tab(self._build_monitor_cal_tab()), 'Monitor calibration')
-        tabs.addTab(_make_scroll_tab(self._build_calibration_tab()), 'Calibration')
-        tabs.addTab(_make_scroll_tab(self._build_debug_tab()), 'Debug')
-        tabs.addTab(_make_scroll_tab(self._build_settings_tab()), 'Settings')
+        self._shell = shell.AppShell('OSpRad')
+        self.setCentralWidget(self._shell)
+        self._shell.chip.clicked.connect(self._open_connection_panel)
+        self._shell.add_page('Measure', 'measure', self._build_main_tab())
+        self._shell.add_page('History', 'history', self._build_history_tab())
+        self._shell.add_page('Calibrate', 'calibrate', self._build_calibration_tab())
+        self._more = shell.StepList()
+        self._more.set_list_container(_make_scroll_tab(self._more.list_widget()))
+        self._more.add('Monitor calibration', 'Fit a display\'s primaries and tone curve '
+                       'for Psychtoolbox', _make_scroll_tab(self._build_monitor_cal_tab()))
+        self._more.add('Settings', 'Appearance, logging, connection, data folder',
+                       _make_scroll_tab(self._build_settings_tab()))
+        self._more.add('Log', 'Component checks and the event log',
+                       _make_scroll_tab(self._build_debug_tab()))
+        self.updates_page = UpdatesPage(self)
+        self._more.add('Updates', '', _make_scroll_tab(self.updates_page))
+        self.updates_page.refresh()
+        self._more.add('About', 'Version, citation and licences',
+                       _make_scroll_tab(self._build_about_page()))
+        self._shell.add_page('More', 'more', self._more)
+        self._shell.wide_changed.connect(self._on_wide_changed)
+        self._on_wide_changed(self._shell.is_wide())
         self._ui_ready = True
         self._refresh_log_level_hint()
         self._sync_sections()
@@ -491,7 +490,7 @@ class OSpRadApp(QMainWindow):
         self.save_hint_label.setText(
             'Every reading the run saves is named after this label with a number '
             'after it, so "lamp" becomes lamp_1, lamp_2, and so on.' if repeat else
-            'Names this reading in the History tab.')
+            'Names this reading in History.')
         self._set_save_error(self.save_error_label.text(),
                              self.save_error_label.property('role') or 'bad')
         # Unfolding a checkable QGroupBox re enables every child, which would offer
@@ -503,8 +502,19 @@ class OSpRadApp(QMainWindow):
         return (self.unit_setup_tab, self.linearisation_tab, self.sensitivity_tab,
                 self.cosine_tab, self.transfer_tab, self.monitor_cal_tab)
 
+    def _on_wide_changed(self, wide):
+        self._measure_page.set_wide(wide)
+        self._history_page.set_wide(wide)
+        self.saved_tree.setMaximumHeight(16777215 if wide else 300)
+
     def _apply_theme(self):
-        QApplication.instance().setStyleSheet(DARK_QSS if self.dark_mode else LIGHT_QSS)
+        self.dark_mode = theme.apply(QApplication.instance(), self.theme_mode)
+        tokens = theme.tokens(self.dark_mode)
+        self._shell.apply_theme(tokens)
+        for steps in (self._cal_steps, self._more):
+            steps.apply_theme(tokens)
+        for button, name in self._plot_buttons:
+            button.setIcon(shell.icon(name, tokens['text']))
         self.plot.apply_theme(self.dark_mode)
         self.history_plot.apply_theme(self.dark_mode)
         # These four own a plot of their own (and the cosine tab an angle diagram).
@@ -513,14 +523,37 @@ class OSpRadApp(QMainWindow):
                        self.cosine_tab, self.monitor_cal_tab):
             widget.apply_theme(self.dark_mode)
 
-    def _toggle_theme(self, checked):
-        self.dark_mode = checked
-        _set_setting(SETTING_DARK_MODE, checked)
+    def _on_theme_changed(self, index):
+        self.theme_mode = theme.MODES[index]
+        _set_setting(SETTING_THEME, self.theme_mode)
         self._apply_theme()
 
     def _build_main_tab(self):
         content = QWidget()
         layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(12)
+
+        reading = shell.Card()
+        value_row = QHBoxLayout()
+        self.reading_value_label = QLabel('\N{EM DASH}')
+        _set_role(self.reading_value_label, 'value')
+        value_row.addWidget(self.reading_value_label, 0, Qt.AlignmentFlag.AlignBaseline)
+        self.reading_unit_label = QLabel('')
+        _set_role(self.reading_unit_label, 'unit')
+        value_row.addWidget(self.reading_unit_label, 0, Qt.AlignmentFlag.AlignBaseline)
+        value_row.addStretch(1)
+        reading.body.addLayout(value_row)
+        self.reading_detail_label = wrapped_label('No reading yet. Point the OSpRad at '
+                                                  'something and choose a mode below.')
+        _set_role(self.reading_detail_label, 'muted')
+        reading.body.addWidget(self.reading_detail_label)
+        layout.addWidget(reading)
+
+        # Lives in the panel the header's status chip opens.
+        self._connection_content = QWidget()
+        connection_layout = QVBoxLayout(self._connection_content)
+        connection_layout.setContentsMargins(0, 0, 0, 0)
 
         port_row = QHBoxLayout()
         port_tip = ('Which serial port to connect to. Auto detect finds the OSpRad by '
@@ -528,26 +561,28 @@ class OSpRadApp(QMainWindow):
         port_row.addWidget(QLabel('Port'))
         port_row.addWidget(help_button(port_tip))
         self.port_combo = QComboBox()
+        self.port_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.port_combo.setMinimumContentsLength(12)
         tip(self.port_combo, port_tip)
         port_row.addWidget(self.port_combo, 1)
         self.bt_refresh_ports = QPushButton('Refresh')
         self.bt_refresh_ports.clicked.connect(self._refresh_ports)
         port_row.addWidget(self.bt_refresh_ports)
-        layout.addLayout(port_row)
+        connection_layout.addLayout(port_row)
         self._refresh_ports()
 
-        conn_row = QHBoxLayout()
         self.conn_status_label = wrapped_label('Not connected.')
         _set_role(self.conn_status_label, 'muted')
-        conn_row.addWidget(self.conn_status_label, 1)
+        connection_layout.addWidget(self.conn_status_label)
+        self.panel_sensor_label = wrapped_label('')
+        _set_role(self.panel_sensor_label, 'muted')
+        connection_layout.addWidget(self.panel_sensor_label)
         self.bt_connect = QPushButton('Reconnect')
+        _set_role(self.bt_connect, 'primary')
         self.bt_connect.clicked.connect(self._connect)
-        conn_row.addWidget(self.bt_connect)
-        layout.addLayout(conn_row)
-
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        layout.addWidget(separator)
+        connection_layout.addWidget(self.bt_connect)
+        self._connection_sheet = None
 
         # The three things the OSpRad can be doing are one accordion: exactly
         # one open at a time, so the controls on screen always belong to the mode
@@ -562,19 +597,21 @@ class OSpRadApp(QMainWindow):
             % (WHEEL_ROLE_HELP['R'], WHEEL_ROLE_HELP['I'])))
         measure_layout.addLayout(measure_header)
 
+        measure_buttons = QHBoxLayout()
         self.bt_rad = QPushButton('Radiance')
-        self.bt_rad.setMinimumHeight(36)
+        _set_role(self.bt_rad, 'primary')
         self.bt_rad.setEnabled(False)
         self.bt_rad.clicked.connect(lambda: self._measure('r'))
         tip(self.bt_rad, WHEEL_ROLE_HELP['R'])
-        measure_layout.addWidget(self.bt_rad)
+        measure_buttons.addWidget(self.bt_rad)
 
         self.bt_irr = QPushButton('Irradiance')
-        self.bt_irr.setMinimumHeight(36)
+        _set_role(self.bt_irr, 'primary')
         self.bt_irr.setEnabled(False)
         self.bt_irr.clicked.connect(lambda: self._measure('i'))
         tip(self.bt_irr, WHEEL_ROLE_HELP['I'])
-        measure_layout.addWidget(self.bt_irr)
+        measure_buttons.addWidget(self.bt_irr)
+        measure_layout.addLayout(measure_buttons)
 
         layout.addWidget(measure_box)
 
@@ -620,13 +657,12 @@ class OSpRadApp(QMainWindow):
         live_row.addStretch(1)
         live_layout.addLayout(live_row)
 
-        self.continuous_status_label = QLabel('Not running.')
+        self.continuous_status_label = wrapped_label('Not running.')
         _set_role(self.continuous_status_label, 'muted')
         live_layout.addWidget(self.continuous_status_label)
 
         # Indented under the row above, matching the repeat box below.
-        live_modes = QHBoxLayout()
-        live_modes.setContentsMargins(20, 0, 0, 0)
+        live_modes = FlowLayout()
         live_measure_label = QLabel('Measure:')
         _set_role(live_measure_label, 'muted')
         live_measure_tip = ('Which reading each update takes. Tick both to alternate '
@@ -642,8 +678,7 @@ class OSpRadApp(QMainWindow):
         live_modes.addStretch(1)
         live_layout.addLayout(live_modes)
 
-        hold_row = QHBoxLayout()
-        hold_row.setContentsMargins(20, 0, 0, 0)
+        hold_row = FlowLayout()
         hold_tip = (
             'Stops the shutter wheel moving during a live run, at the cost of the '
             'readings slowly going wrong. For demonstrating only.\n\n'
@@ -685,15 +720,15 @@ class OSpRadApp(QMainWindow):
                       'box, without asking again.\n\n'
                       'Tick Irradiance and/or Radiance below to choose what is '
                       'measured each time, then press Start. Readings all share the '
-                      'same label, so tell them apart by their timestamp in the '
-                      'History tab.')
+                      'same label, so tell them apart by their timestamp in '
+                      'History.')
         repeat_header = QHBoxLayout()
         repeat_header.addWidget(wrapped_label(
             'Measure and save on a timer, unattended.'), 1)
         repeat_header.addWidget(help_button(repeat_tip))
         repeat_layout.addLayout(repeat_header)
 
-        repeat_row = QHBoxLayout()
+        repeat_row = FlowLayout()
         repeat_row.addWidget(QLabel('Every (s)'))
         self.repeat_time_edit = QLineEdit('300')
         self.repeat_time_edit.setFixedWidth(60)
@@ -713,13 +748,12 @@ class OSpRadApp(QMainWindow):
         repeat_row.addStretch(1)
         repeat_layout.addLayout(repeat_row)
 
-        self.repeat_status_label = QLabel('Not running.')
+        self.repeat_status_label = wrapped_label('Not running.')
         _set_role(self.repeat_status_label, 'muted')
         repeat_layout.addWidget(self.repeat_status_label)
 
         # Indented under the row above; checkboxes only do anything while repeat runs.
-        repeat_modes = QHBoxLayout()
-        repeat_modes.setContentsMargins(20, 0, 0, 0)
+        repeat_modes = FlowLayout()
         measure_label = QLabel('Measure:')
         _set_role(measure_label, 'muted')
         measure_tip = ('Which reading(s) each automatic repeat takes. Tick both to '
@@ -764,8 +798,7 @@ class OSpRadApp(QMainWindow):
         # the duration of a run, so offering them there would only invite edits it
         # is about to overwrite.
         self._settings_box = QGroupBox('Measurement settings')
-        settings = QGridLayout(self._settings_box)
-        settings.setColumnStretch(2, 1)
+        settings = QVBoxLayout(self._settings_box)
 
         int_time_label = QLabel('Integration time (ms)')
         self.int_time_edit = QLineEdit('0')
@@ -775,27 +808,28 @@ class OSpRadApp(QMainWindow):
                         'only when repeated measurements need identical exposure.')
         tip(int_time_label, int_time_tip)
         tip(self.int_time_edit, int_time_tip)
-        settings.addWidget(captioned(int_time_label, int_time_tip), 0, 0)
-        settings.addWidget(self.int_time_edit, 0, 1)
+        int_time_row = FlowLayout()
+        int_time_row.addWidget(captioned(int_time_label, int_time_tip))
+        int_time_row.addWidget(self.int_time_edit)
+        settings.addLayout(int_time_row)
 
         scans_label = QLabel('Scans, min / max')
-        scans_row = QHBoxLayout()
         self.min_scans_edit = QLineEdit('3')
         self.min_scans_edit.setFixedWidth(45)
         self.max_scans_edit = QLineEdit('50')
         self.max_scans_edit.setFixedWidth(45)
-        scans_row.addWidget(self.min_scans_edit)
-        scans_row.addWidget(QLabel('/'))
-        scans_row.addWidget(self.max_scans_edit)
-        scans_row.addStretch(1)
         scans_tip = ('How many scans the firmware averages into one measurement. The '
                      'firmware picks a value in this range itself. Short exposures need '
                      'more repeats to fill ~1s of total sampling time.')
         tip(scans_label, scans_tip)
         tip(self.min_scans_edit, scans_tip)
         tip(self.max_scans_edit, scans_tip)
-        settings.addWidget(captioned(scans_label, scans_tip), 1, 0)
-        settings.addLayout(scans_row, 1, 1)
+        scans_row = FlowLayout()
+        scans_row.addWidget(captioned(scans_label, scans_tip))
+        scans_row.addWidget(self.min_scans_edit)
+        scans_row.addWidget(QLabel('/'))
+        scans_row.addWidget(self.max_scans_edit)
+        settings.addLayout(scans_row)
         layout.addWidget(self._settings_box)
 
         # One label field, two shapes. A single measurement is saved by hand, under
@@ -806,7 +840,7 @@ class OSpRadApp(QMainWindow):
         label_row = QHBoxLayout()
         label_row.addWidget(QLabel('Label'))
         label_row.addWidget(help_button(
-            'Names the reading in the History tab. Readings are not required to have '
+            'Names the reading in History. Readings are not required to have '
             'unique labels. If you reuse one, OSpRad asks whether to keep both or '
             'replace the older reading.\n\n'
             'Under Automatic repeat the label is a stem rather than a name: every '
@@ -824,7 +858,7 @@ class OSpRadApp(QMainWindow):
         save_layout.addWidget(self.save_hint_label)
 
         self.bt_save = QPushButton('Save reading')
-        self.bt_save.setMinimumHeight(36)
+        _set_role(self.bt_save, 'primary')
         self.bt_save.clicked.connect(self._on_save_clicked)
         tip(self.bt_save, 'Save the current reading to the history, under the label above.')
         save_layout.addWidget(self.bt_save)
@@ -840,36 +874,51 @@ class OSpRadApp(QMainWindow):
         self._refresh_save_button()
         layout.addWidget(self._build_analysis())
 
+        layout.addStretch(1)
+
         self.cursor_label = QLabel('')
         _set_role(self.cursor_label, 'muted')
-
         self.plot = plotting.SpectrumPlot(dark=self.dark_mode)
         self.plot.on_hover = lambda text: self.cursor_label.setText(text or '')
-        plot_layout = QVBoxLayout()
-        toolbar = _fit_width(_PlotToolbar(self.plot.canvas, content))
-        plot_layout.addWidget(toolbar)
-        plot_layout.addWidget(self.cursor_label)
-        plot_layout.addWidget(self.plot.canvas, 1)
-        layout.addLayout(plot_layout, 1)
+        card = self._plot_card(self.plot, 'osprad-plot', self.cursor_label)
+        self._measure_page = shell.SplitPage(_make_scroll_tab(content), layout, card, 1,
+                                             lambda page: int(page.height() * 0.45))
+        return self._measure_page
 
-        actions = QHBoxLayout()
-        # Dark mode lives on the Settings tab now. It is an app wide preference, not
-        # a main tab control, and it was stranded below the plot on a phone.
-        actions.addStretch(1)
-        save_fig_btn = QPushButton('Save figure...')
-        # Lambda, not a bare connect: clicked emits a `checked` bool that would
-        # otherwise arrive as the `plot` argument.
-        save_fig_btn.clicked.connect(lambda: self._save_figure(self.plot, 'osprad-plot'))
-        actions.addWidget(save_fig_btn)
-        layout.addLayout(actions)
-
-        return content
+    def _plot_card(self, plot, stem, extra=None):
+        """The plot with Zoom / Reset / Save; drags only zoom while Zoom is on, so on a
+        touchscreen they otherwise scroll the page."""
+        card = shell.Card()
+        card.body.setContentsMargins(8, 8, 8, 8)
+        driver = NavigationToolbar2QT(plot.canvas, card)
+        driver.hide()
+        row = QHBoxLayout()
+        if extra is not None:
+            row.addWidget(extra, 1)
+        else:
+            row.addStretch(1)
+        if not hasattr(self, '_plot_buttons'):
+            self._plot_buttons = []
+        for name, text, action in (('zoom', 'Zoom', driver.zoom), ('reset', 'Reset', driver.home),
+                                   ('save', 'Save', lambda: self._save_figure(plot, stem))):
+            button = QToolButton()
+            button.setObjectName('flat')
+            button.setIconSize(QSize(20, 20))
+            button.setFixedSize(40, 40)
+            button.setToolTip(text)
+            button.setAccessibleName(text)
+            button.setCheckable(name == 'zoom')
+            button.clicked.connect(lambda _=False, a=action: a())
+            row.addWidget(button)
+            self._plot_buttons.append((button, name))
+        card.body.addLayout(row)
+        card.body.addWidget(plot.canvas, 1)
+        return card
 
     def _build_analysis(self):
         group = QGroupBox('Analysis')
         grid = QGridLayout(group)
         grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
 
         tips = {
             'peak': 'Wavelength of the highest intensity. Daylight/white LEDs peak '
@@ -892,15 +941,14 @@ class OSpRadApp(QMainWindow):
         self._analysis_labels = {}
         fields = (('peak', 'Peak λ'), ('fwhm', 'FWHM'),
                   ('cie_x', 'CIE x'), ('cie_y', 'CIE y'), ('cct', 'CCT'))
-        for i, (key, caption) in enumerate(fields):
-            row, col = divmod(i, 2)
+        for row, (key, caption) in enumerate(fields):
             caption_label = QLabel(caption + ':')
             _set_role(caption_label, 'muted')
             tip(caption_label, tips[key])
-            grid.addWidget(captioned(caption_label, tips[key]), row, col * 2)
+            grid.addWidget(captioned(caption_label, tips[key]), row, 0)
             value = QLabel('-')
             tip(value, tips[key])
-            grid.addWidget(value, row, col * 2 + 1)
+            grid.addWidget(value, row, 1)
             self._analysis_labels[key] = value
 
         return group
@@ -908,6 +956,8 @@ class OSpRadApp(QMainWindow):
     def _build_history_tab(self):
         content = QWidget()
         layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(10)
 
         header = QHBoxLayout()
         saved_label = QLabel('Saved readings')
@@ -921,43 +971,48 @@ class OSpRadApp(QMainWindow):
         self.saved_tree = QTreeWidget()
         # "When" carries date + time: it sorts chronologically as plain text, and
         # it surfaces the date, which the index has always carried but never showed.
-        self.saved_tree.setHeaderLabels(['When', 'Label', 'Mode', 'Lux/cd·m²'])
+        self.saved_tree.setHeaderLabels(['When', 'Label', 'Mode', 'Lux/cd·m²', ''])
         self.saved_tree.setSortingEnabled(True)
         self.saved_tree.sortByColumn(COL_WHEN, Qt.SortOrder.DescendingOrder)
         self.saved_tree.setRootIsDecorated(False)
         self.saved_tree.setSelectionMode(QTreeWidget.SelectionMode.ExtendedSelection)
-        self.saved_tree.setMaximumHeight(220)
+        header = self.saved_tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(COL_LABEL, header.ResizeMode.Stretch)
+        header.setSectionResizeMode(COL_MENU, header.ResizeMode.Fixed)
+        self.saved_tree.setColumnWidth(COL_MENU, 40)
+        self._history_delegate = _TwoLineDelegate(self.saved_tree)
+        self.saved_tree.setItemDelegateForColumn(COL_LABEL, self._history_delegate)
+        self.saved_tree.setColumnHidden(COL_WHEN, True)  # shown under the label instead
+        self.saved_tree.setColumnHidden(COL_MODE, True)
         self.saved_tree.itemDoubleClicked.connect(self._on_saved_double_click)
+        self.saved_tree.itemClicked.connect(self._on_saved_clicked)
         self.saved_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.saved_tree.customContextMenuRequested.connect(self._on_saved_context_menu)
         # There is no right button on a phone, so a long press raises the same menu.
         # Held on the viewport, which is what customContextMenuRequested reports against.
         self._tree_long_press = touch.install_long_press(
             self.saved_tree.viewport(), self._on_saved_context_menu)
-        layout.addWidget(self.saved_tree)
+        layout.addWidget(self.saved_tree, 1)
 
-        layout.addWidget(wrapped_label(
-            'Double click (or double tap) a reading to add it to the comparison plot '
-            'below; again to remove it. Right click, or press and hold on a '
-            'touchscreen, for more options, including on a multi selection.'))
+        hint = wrapped_label(
+            'Tap \N{MIDLINE HORIZONTAL ELLIPSIS} for a reading\'s options. Double click (or '
+            'double tap) a reading to add it to the comparison plot; again to remove it.')
+        _set_role(hint, 'muted')
+        layout.addWidget(hint)
 
         self.history_plot = plotting.SpectrumPlot(dark=self.dark_mode)
-        plot_layout = QVBoxLayout()
-        toolbar = _fit_width(_PlotToolbar(self.history_plot.canvas, content))
-        plot_layout.addWidget(toolbar)
-        plot_layout.addWidget(self.history_plot.canvas, 1)
-        layout.addLayout(plot_layout, 1)
+        card = self._plot_card(self.history_plot, 'osprad-comparison')
+        self._history_page = shell.SplitPage(_make_scroll_tab(content), layout, card, 3,
+                                             lambda page: int(page.height() * 0.5))
+        return self._history_page
 
-        # The comparison plot had no export of its own once the toolbar's Save went.
-        history_actions = QHBoxLayout()
-        history_actions.addStretch(1)
-        save_history_fig_btn = QPushButton('Save figure...')
-        save_history_fig_btn.clicked.connect(
-            lambda: self._save_figure(self.history_plot, 'osprad-comparison'))
-        history_actions.addWidget(save_history_fig_btn)
-        layout.addLayout(history_actions)
-
-        return content
+    def _on_saved_clicked(self, item, column):
+        if column == COL_MENU:
+            self.saved_tree.setCurrentItem(item)
+            rect = self.saved_tree.visualItemRect(item)
+            self._build_saved_menu().exec(
+                self.saved_tree.viewport().mapToGlobal(rect.bottomRight()))
 
     # Monitor calibration is a downstream USE of an already calibrated device,
     # blocked by MonitorCalibrationTab._start() until the unit is set up, hence a
@@ -970,27 +1025,148 @@ class OSpRadApp(QMainWindow):
     # ---------------- Calibration tab ----------------
 
     def _build_calibration_tab(self):
-        content = QWidget()
-        layout = QVBoxLayout(content)
-        layout.addWidget(wrapped_label(
+        self._cal_steps = shell.StepList(
             'One time setup per unit. Unit number and wheel positions live on the '
             'Arduino; linearisation and spectral sensitivity live in '
-            'calibration_data.csv.'))
-
-        cal_tabs = QTabWidget()
+            'calibration_data.csv.', on_list_shown=self._refresh_cal_summaries)
+        self._cal_steps.set_list_container(_make_scroll_tab(self._cal_steps.list_widget()))
         self.unit_setup_tab = UnitSetupTab(self.connection, self.store)
         self.linearisation_tab = LinearisationTab(self.connection, self.store)
         self.sensitivity_tab = SensitivityTab(self.connection, self.store)
         self.cosine_tab = CosineResponseTab(self.connection, self.store)
         self.transfer_tab = CalibrationTransferTab(self.connection, self.store, self._log)
-        cal_tabs.addTab(self.unit_setup_tab, 'Unit & wheel setup')
-        cal_tabs.addTab(self.linearisation_tab, 'Linearisation')
-        cal_tabs.addTab(self.sensitivity_tab, 'Spectral sensitivity')
-        cal_tabs.addTab(self.cosine_tab, 'Cosine response')
-        cal_tabs.addTab(self.transfer_tab, 'Import & export')
-        layout.addWidget(cal_tabs, 1)
+        for title, page in (('1  Unit & wheel', self.unit_setup_tab),
+                            ('2  Linearisation', self.linearisation_tab),
+                            ('3  Spectral sensitivity', self.sensitivity_tab),
+                            ('4  Cosine response', self.cosine_tab),
+                            ('5  Import & export', self.transfer_tab)):
+            self._cal_steps.add(title, '', _make_scroll_tab(page))
+        self._refresh_cal_summaries()
+        return self._cal_steps
 
+    def _refresh_cal_summaries(self):
+        config = self._config
+        calib = None
+        if config is not None:
+            try:
+                calib = self.store.get(config.unit_number)
+            except calibration.CalibrationError:
+                pass
+        if config is None:
+            wheel = 'Shutter wheel positions; connect to see them'
+        else:
+            wheel = ('Unit %d \N{MIDDLE DOT} dark %d \N{MIDDLE DOT} irradiance %d '
+                     '\N{MIDDLE DOT} radiance %d'
+                     % (config.unit_number, config.dark, config.irr, config.rad))
+        if calib is None:
+            lin = sens = 'No calibration loaded for this unit yet'
+        else:
+            lin = 'a = %.4g, b = %.4g' % tuple(calib.lin_coefs)
+            sens = ' \N{MIDDLE DOT} '.join(
+                '%s %s' % (name, 'set' if any(v > 0 for v in values) else 'missing')
+                for name, values in (('Radiance', calib.rad_sens),
+                                     ('Irradiance', calib.irr_sens)))
+            if calib.is_default:
+                sens += ' (shipped defaults)'
+        for i, text in enumerate((wheel, lin, sens,
+                                  'Check the diffuser\'s response against angle',
+                                  'Unit number, and backing up a calibration as one file')):
+            self._cal_steps.set_summary(i, text)
+
+    def _build_about_page(self):
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(12, 8, 12, 12)
+        layout.setSpacing(12)
+        about = shell.Card('OSpRad %s' % __version__)
+        self.about_firmware_label = wrapped_label('Firmware: not connected')
+        _set_role(self.about_firmware_label, 'muted')
+        about.body.addWidget(self.about_firmware_label)
+        about.body.addWidget(wrapped_label(
+            'An open source, low cost, high sensitivity spectroradiometer. Free software '
+            'under the GNU General Public License v3.0, without warranty of any kind.'))
+        layout.addWidget(about)
+        cite = shell.Card('Citation')
+        citation = wrapped_label(
+            'Troscianko, J. (2023) OSpRad: an open-source, low-cost, high-sensitivity '
+            'spectroradiometer. Journal of Experimental Biology. '
+            'https://doi.org/10.1242/jeb.245416')
+        citation.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        cite.body.addWidget(citation)
+        layout.addWidget(cite)
+        try:
+            from _font_bundled import LICENSE_TEXT
+        except ImportError:
+            LICENSE_TEXT = ''
+        if LICENSE_TEXT:
+            font_box, font_layout = collapsible_group('Font licence (Inter)')
+            font_text = wrapped_label(LICENSE_TEXT)
+            _set_role(font_text, 'muted')
+            font_layout.addWidget(font_text)
+            layout.addWidget(font_box)
+        layout.addStretch(1)
         return content
+
+    # The interface UpdatesPage uses.
+
+    get_setting = staticmethod(_get_setting)
+    set_setting = staticmethod(_set_setting)
+
+    def log(self, text, level='info'):
+        self._log(text, level=level)
+
+    def unit_firmware(self):
+        return self._config.firmware if self._config is not None else None
+
+    def updates_summary(self, text):
+        self._more.set_summary(UPDATES_ROW, text)
+
+    def reconnect(self):
+        self._connect()
+
+    def connected_port(self):
+        return self.connection.port if self.connection is not None else None
+
+    def release_for_flashing(self, port):
+        """Free `port` for the flasher, closing the connection if it is on it. False
+        while a measurement or connect is using the unit."""
+        if (self._measure_worker is not None or self._continuous_running
+                or self._repeat_running or self._connecting):
+            return False
+        if self.connected_port() == port:
+            self._heartbeat_timer.stop()
+            try:
+                self.connection.close()
+            except Exception:
+                pass
+            self.connection = None
+            self._config = None
+            self._propagate_connection()
+            self._update_controls()
+            self._shell.chip.set_state('Flashing\N{HORIZONTAL ELLIPSIS}', 'busy')
+        return True
+
+    def keyPressEvent(self, event):
+        # The phone's back gesture (and Esc) steps back a level instead of closing.
+        if event.key() in (Qt.Key.Key_Back, Qt.Key.Key_Escape) and self._go_back():
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _go_back(self):
+        page = self._shell.stack.currentWidget()
+        if isinstance(page, shell.StepList) and not page.at_list():
+            page.show_list()
+            return True
+        if self._shell.stack.currentIndex() != 0:
+            self._shell.select(0)
+            return True
+        return False
+
+    def _open_connection_panel(self):
+        if self._connection_sheet is None:
+            self._connection_sheet = shell.Sheet(self, 'Connection', self._connection_content)
+        self._connection_sheet.open_fitted()
 
     def _build_debug_tab(self):
         content = QWidget()
@@ -1005,10 +1181,10 @@ class OSpRadApp(QMainWindow):
         separator.setFrameShape(QFrame.Shape.HLine)
         comp_layout.addWidget(separator)
 
-        self.sensor_verdict_label = QLabel('? Optical sensor: unknown')
+        self.sensor_verdict_label = wrapped_label('? Optical sensor: unknown')
         _set_role(self.sensor_verdict_label, 'muted')
         comp_layout.addWidget(self.sensor_verdict_label)
-        self.sensor_detail_label = QLabel('')
+        self.sensor_detail_label = wrapped_label('')
         _set_role(self.sensor_detail_label, 'muted')
         comp_layout.addWidget(self.sensor_detail_label)
 
@@ -1070,6 +1246,8 @@ class OSpRadApp(QMainWindow):
         return None if text == PORT_AUTO else text
 
     def _connect(self):
+        if self.updates_page.flashing:
+            return  # the flasher owns the port; it reconnects when done
         # Runs on a background QThread (qt_worker.Worker); blocking the main thread
         # would freeze the UI including the log that's supposed to show progress.
         self.connection = None
@@ -1077,6 +1255,8 @@ class OSpRadApp(QMainWindow):
         # cache of what we last pushed is no longer true.
         self._prev_int_time = None
         self._prev_scans = None
+        self._connecting = True
+        self._config = None
         self._set_connected(False)
         self._propagate_connection()
         self.bt_connect.setEnabled(False)
@@ -1085,6 +1265,7 @@ class OSpRadApp(QMainWindow):
         self._log('Connecting...')
         self._update_conn_labels('Connecting...')
         self.sensor_verdict_label.setText('? Optical sensor: unknown')
+        self.panel_sensor_label.setText('')
         _set_role(self.sensor_verdict_label, 'muted')
         self.sensor_detail_label.setText('')
 
@@ -1100,10 +1281,17 @@ class OSpRadApp(QMainWindow):
     def _do_connect(self):
         self.store.load()
         connection = serial_io.SerialConnection(port=self._connect_port)
-        config = connection.check_firmware()
+        try:
+            config = connection.check_firmware()
+        except Exception:
+            connection.close()  # or the port stays open and blocks a flash
+            raise
         return connection, config
 
     def _connect_failed(self, message):
+        self._connecting = False
+        self.updates_page.refresh()
+        self._update_controls()
         self.bt_connect.setEnabled(True)
         self.bt_connect.setText('Reconnect')
         self._log(message, level='error')
@@ -1112,6 +1300,13 @@ class OSpRadApp(QMainWindow):
     def _connect_succeeded(self, result):
         connection, config = result
         self.connection = connection
+        self._config = config
+        self._connecting = False
+        self._unit_text = 'Unit %d' % config.unit_number
+        self.about_firmware_label.setText('Firmware: v%s on unit #%d'
+                                          % (config.firmware, config.unit_number))
+        self._refresh_cal_summaries()
+        self.updates_page.refresh()
         connection.measure_timeout = self._measure_timeout_setting()
         self._missed_port_scans = 0
         self._heartbeat_timer.start()
@@ -1139,6 +1334,7 @@ class OSpRadApp(QMainWindow):
                 '? Optical sensor: not checked (needs firmware 1.0.0 or newer)')
             _set_role(self.sensor_verdict_label, 'muted')
             self.sensor_detail_label.setText('')
+            self.panel_sensor_label.setText(self.sensor_verdict_label.text())
             return
         if detected:
             self.sensor_verdict_label.setText('✓ Optical sensor: detected')
@@ -1150,6 +1346,7 @@ class OSpRadApp(QMainWindow):
             'roughness %.2f / repeat %.2f = %.2f (threshold %.2f), raw ADC swing %d'
             % (config.sensor_roughness, config.sensor_repeat, config.sensor_repeat_ratio,
                serial_io.SENSOR_REPEAT_RATIO_THRESHOLD, config.sensor_scan_range))
+        self.panel_sensor_label.setText(self.sensor_verdict_label.text())
 
     def _test_motor(self):
         # RC servos have no feedback wire (see serial_io sensor_self_test); the test
@@ -1167,6 +1364,8 @@ class OSpRadApp(QMainWindow):
     def _update_conn_labels(self, text):
         self.conn_status_label.setText(text)
         self.debug_status_label.setText(text)
+        if self._connection_sheet is not None and self._connection_sheet.isVisible():
+            self._connection_sheet.fit()
 
     def _propagate_connection(self, config=None):
         """Push the connection, and the config we already have, into every tab.
@@ -1198,6 +1397,12 @@ class OSpRadApp(QMainWindow):
         # Counting it as busy stops every control below flickering once per update.
         busy = measuring or self._continuous_running
         idle = connected and not busy
+        if connected:
+            self._shell.chip.set_state(self._unit_text, 'busy' if busy else 'connected')
+        else:
+            self._shell.chip.set_state('Connecting\N{HORIZONTAL ELLIPSIS}' if self._connecting
+                                       else 'Not connected',
+                                       'busy' if self._connecting else 'disconnected')
 
         for button in (self.bt_rad, self.bt_irr, self.bt_motor_test):
             button.setEnabled(idle)
@@ -1244,6 +1449,8 @@ class OSpRadApp(QMainWindow):
         except Exception:
             pass
         self.connection = None
+        self._config = None
+        self.updates_page.refresh()
         self._prev_int_time = None
         self._prev_scans = None
         self._heartbeat_timer.stop()
@@ -1257,6 +1464,7 @@ class OSpRadApp(QMainWindow):
         self._update_controls()
         self.setWindowTitle('OSpRad %s' % __version__)
         self.sensor_verdict_label.setText('? Optical sensor: unknown')
+        self.panel_sensor_label.setText('')
         _set_role(self.sensor_verdict_label, 'muted')
         self.sensor_detail_label.setText('')
         message = '%s Plug the OSpRad back in, then press Reconnect.' % reason
@@ -1421,6 +1629,18 @@ class OSpRadApp(QMainWindow):
         self.plot.add_curve('live', calib.wavelength, outcome.flux, mode=mode,
                             title=title, subtitle=subtitle, style='live')
         self._show_analysis(outcome)
+        self.reading_value_label.setText(amount)
+        self.reading_unit_label.setText(unit)
+        details = ['Irradiance' if mode == 'i' else 'Radiance']
+        if self._analysis_labels['cct'].text() != '-':
+            details.append(self._analysis_labels['cct'].text())
+        details.append('%d ms \N{MULTIPLICATION SIGN} %d' % (measurement.int_time,
+                                                             measurement.n_scans))
+        details.append(time.strftime('%H:%M:%S'))
+        if measurement.saturated:
+            details.append('%g saturated' % measurement.saturated)
+        self.reading_detail_label.setText(' \N{MIDDLE DOT} '.join(details))
+        _set_role(self.reading_detail_label, 'bad' if measurement.saturated else 'muted')
         # Demoted while continuous mode runs, which would otherwise push every
         # other line out of the 500 line log within a minute.
         self._log('Unit #%d   saturated photosites: %s%s'
@@ -1529,10 +1749,6 @@ class OSpRadApp(QMainWindow):
             for key in ('cie_x', 'cie_y', 'cct'):
                 self._analysis_labels[key].setText('-')
 
-    def _clear_analysis(self):
-        for label in self._analysis_labels.values():
-            label.setText('-')
-
     def _set_save_error(self, message, role='bad'):
         self.save_error_label.setText(message)
         _set_role(self.save_error_label, role)
@@ -1621,7 +1837,7 @@ class OSpRadApp(QMainWindow):
         stamp = time.strftime('%Y-%m-%d %H:%M:%S')
         luminance_text = f'{self._last_luminance:.3g}' if self._last_luminance is not None else ''
         item = _ReadingItem([stamp, label or '(unlabelled)', self.measurement.mode,
-                             luminance_text])
+                             luminance_text, MENU_GLYPH])
         item.setData(COL_WHEN, Qt.ItemDataRole.UserRole, offset)
         # The view owns the ordering now, so append rather than forcing this to the top.
         self.saved_tree.addTopLevelItem(item)
@@ -1639,7 +1855,7 @@ class OSpRadApp(QMainWindow):
         for entry in datalog.iter_index(DATA_FILE):
             item = _ReadingItem(['%s %s' % (entry.date, entry.time),
                                  entry.label or '(unlabelled)', entry.mode,
-                                 f'{entry.luminance:.3g}'])
+                                 f'{entry.luminance:.3g}', MENU_GLYPH])
             item.setData(COL_WHEN, Qt.ItemDataRole.UserRole, entry.offset)
             self.saved_tree.addTopLevelItem(item)
             if entry.label.strip():
@@ -2195,15 +2411,19 @@ class OSpRadApp(QMainWindow):
 
         appearance = QGroupBox('Appearance')
         appearance_layout = QVBoxLayout(appearance)
-        self.dark_mode_check = QCheckBox('Dark mode')
-        self.dark_mode_check.setChecked(self.dark_mode)
-        self.dark_mode_check.toggled.connect(self._toggle_theme)
-        appearance_layout.addWidget(self.dark_mode_check)
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel('Theme'))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(['Follow system', 'Light', 'Dark'])
+        self.theme_combo.setCurrentIndex(theme.MODES.index(self.theme_mode))
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        theme_row.addWidget(self.theme_combo, 1)
+        appearance_layout.addLayout(theme_row)
         layout.addWidget(appearance)
 
         logging_box = QGroupBox('Logging')
         logging_layout = QHBoxLayout(logging_box)
-        level_tip = ('How much detail the Debug tab records. "debug" adds the full '
+        level_tip = ('How much detail the Log records. "debug" adds the full '
                      'serial conversation with the OSpRad; the right setting when '
                      'reporting a problem.')
         logging_layout.addWidget(QLabel('Log level'))
@@ -2221,10 +2441,13 @@ class OSpRadApp(QMainWindow):
         port_tip = ('The port to select automatically at startup. "%s" re detects the '
                     'OSpRad each time, which is usually right; pin a port only if '
                     'auto detect keeps finding the wrong device.' % PORT_AUTO)
-        port_row = QHBoxLayout()
+        port_row = FlowLayout()
         port_row.addWidget(QLabel('Preferred port'))
         port_row.addWidget(help_button(port_tip))
         self.settings_port_combo = QComboBox()
+        self.settings_port_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.settings_port_combo.setMinimumContentsLength(12)
         tip(self.settings_port_combo, port_tip)
         self.settings_port_combo.currentTextChanged.connect(self._on_preferred_port_changed)
         port_row.addWidget(self.settings_port_combo, 1)
@@ -2288,7 +2511,7 @@ class OSpRadApp(QMainWindow):
         self._refresh_log_level_hint()
 
     def _refresh_log_level_hint(self):
-        self.log_level_hint.setText('Level: %s (change on the Settings tab)'
+        self.log_level_hint.setText('Level: %s (change in More \N{RIGHTWARDS ARROW} Settings)'
                                     % self._log_level)
 
     def _measure_timeout_setting(self):
@@ -2377,6 +2600,13 @@ class OSpRadApp(QMainWindow):
         self.log_text.ensureCursorVisible()
 
     def closeEvent(self, event):
+        # Cutting a flash short leaves the unit without working firmware until it is
+        # flashed again, so the window waits for it to finish.
+        if self.updates_page.flashing:
+            QMessageBox.information(self, 'OSpRad', 'Wait for flashing to finish before '
+                                    'closing OSpRad.')
+            event.ignore()
+            return
         self._closing = True
         self._stop_repeat()
         self._stop_continuous()
@@ -2442,6 +2672,7 @@ def main():
     app.setOrganizationName('OSpRad')
     app.setApplicationName('OSpRad')
     app.setWindowIcon(_app_icon())
+    theme.load_font(app)
     # There is no hovering on a touchscreen, so the tooltips scattered through the
     # app would otherwise be unreachable there. Bound to the app so it outlives this scope.
     app._touch_tooltips = touch.enable_touch_tooltips(app)

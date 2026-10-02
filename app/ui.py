@@ -3,21 +3,116 @@
 
 import html
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, QRect, QSize, Qt
 from PySide6.QtWidgets import (QApplication, QDialog, QDialogButtonBox, QFrame,
-                               QGroupBox, QHBoxLayout, QLabel, QScrollArea,
+                               QGroupBox, QHBoxLayout, QLabel, QLayout, QScrollArea,
                                QScroller, QSizePolicy, QToolButton, QVBoxLayout,
-                               QWidget)
+                               QWidget, QWidgetItem)
 
 # Matches the old Tkinter Tooltip wrap width.
 TOOLTIP_WIDTH_PX = 280
 
-# Small enough to read as a superscript marker on the caption it belongs to, while
-# staying a usable tap target.
-HELP_BUTTON_PX = 16
+HELP_BUTTON_PX = 26
 
 # Comfortable reading width for a help paragraph; capped to the screen at runtime.
 HELP_DIALOG_WIDTH_PX = 420
+
+
+class FlowLayout(QLayout):
+    """A row that wraps onto further lines when the window is too narrow for it.
+    Takes the same addWidget/addStretch/addSpacing calls as QHBoxLayout (the last two
+    do nothing), so a row converts by swapping its class."""
+
+    def __init__(self, parent=None, spacing=8):
+        super().__init__(parent)
+        self._items = []
+        self.setContentsMargins(0, 0, 0, 0)
+        self.setSpacing(spacing)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def addWidget(self, widget, *_):
+        self.addChildWidget(widget)
+        self.addItem(QWidgetItem(widget))
+
+    def addStretch(self, *_):
+        pass
+
+    def addSpacing(self, *_):
+        pass
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, index):
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._arrange(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._arrange(rect, apply=True)
+
+    def sizeHint(self):
+        visible = [i.sizeHint() for i in self._items if not i.isEmpty()]
+        width = sum(s.width() for s in visible) + self.spacing() * max(0, len(visible) - 1)
+        return QSize(width, max((s.height() for s in visible), default=0))
+
+    def minimumSize(self):
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        return size
+
+    @staticmethod
+    def _glued(item):
+        """Captions stay on the line of the control that follows them."""
+        widget = item.widget()
+        return isinstance(widget, QLabel) or (widget is not None and (
+            widget.objectName() == 'help' or widget.property('caption')))
+
+    def _arrange(self, rect, apply):
+        chunks, chunk = [], []
+        for item in self._items:
+            if item.isEmpty():
+                continue
+            chunk.append((item, item.sizeHint()))
+            if not self._glued(item):
+                chunks.append(chunk)
+                chunk = []
+        if chunk:
+            chunks.append(chunk)
+        lines, line, x = [], [], 0
+        for chunk in chunks:
+            width = sum(h.width() for _, h in chunk) + self.spacing() * (len(chunk) - 1)
+            if line and x + width > rect.width():
+                lines.append(line)
+                line, x = [], 0
+            line.extend(chunk)
+            x += width + self.spacing()
+        if line:
+            lines.append(line)
+        y = rect.y()
+        for line in lines:
+            height = max(h.height() for _, h in line)
+            x = rect.x()
+            for item, hint in line:
+                if apply:
+                    item.setGeometry(QRect(QPoint(x, y + (height - hint.height()) // 2), hint))
+                x += hint.width() + self.spacing()
+            y += height + self.spacing()
+        return max(0, y - rect.y() - self.spacing())
 
 
 def wrapped_label(text):
@@ -101,16 +196,10 @@ def help_button(text, title='OSpRad'):
     The tooltip is kept as well, so desktop hover still shows the same text.
     """
     button = QToolButton()
-    button.setText('?')
-    button.setAutoRaise(True)
+    button.setObjectName('help')
+    button.setText('i')
     button.setFixedSize(HELP_BUTTON_PX, HELP_BUTTON_PX)
-    # Smaller than the caption it annotates, so it reads as a marker rather than a
-    # control competing with it.
-    font = button.font()
-    font.setPointSizeF(max(6.5, font.pointSizeF() - 1.5))
-    font.setBold(True)
-    button.setFont(font)
-    # How the tests find these, and what a screen reader announces.
+    # What a screen reader announces.
     button.setAccessibleName('Help')
     tip(button, text)
     button.clicked.connect(lambda: show_help(button, text, title))
@@ -118,19 +207,20 @@ def help_button(text, title='OSpRad'):
 
 
 def captioned(caption_widget, help_text, title='OSpRad'):
-    """[caption][?] as one widget, so it drops into a single existing layout slot.
-
-    The '?' sits tight against the caption's top right, like a footnote marker,
-    rather than floating as a separate control.
-    """
+    """[caption][i] as one widget, so it drops into a single existing layout slot.
+    Tapping the caption itself opens the help too: it is the bigger target."""
     holder = QWidget()
     row = QHBoxLayout(holder)
     row.setContentsMargins(0, 0, 0, 0)
-    row.setSpacing(0)
-    row.addWidget(caption_widget, 0, Qt.AlignmentFlag.AlignBottom)
-    row.addWidget(help_button(help_text, title), 0, Qt.AlignmentFlag.AlignTop)
+    row.setSpacing(6)
+    button = help_button(help_text, title)
+    caption_widget.mouseReleaseEvent = lambda event: button.click()
+    caption_widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    row.addWidget(caption_widget, 0, Qt.AlignmentFlag.AlignVCenter)
+    row.addWidget(button, 0, Qt.AlignmentFlag.AlignVCenter)
     row.addStretch(1)
     holder.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+    holder.setProperty('caption', True)
     return holder
 
 
@@ -161,12 +251,12 @@ class UnitBanner(QWidget):
     overwrite.
     """
 
-    HELP = ('Everything on this tab applies to the unit number reported by the connected '
+    HELP = ('Everything on this page applies to the unit number reported by the connected '
             'OSpRad, which is stored on its Arduino.\n\n'
             'Wavelength, sensitivity and linearisation curves are saved per unit number '
             'in calibration_data.csv. The shutter wheel positions and the unit number '
             'itself live on the Arduino.\n\n'
-            'To change which unit number this OSpRad reports, use the Import & export tab.')
+            'To change which unit number this OSpRad reports, use Calibrate \N{RIGHTWARDS ARROW} Import & export.')
 
     def __init__(self):
         super().__init__()

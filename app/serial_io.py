@@ -3,6 +3,7 @@
 
 import contextlib
 import logging
+import os
 import sys
 import threading
 import time
@@ -130,8 +131,26 @@ def _patch_usbserial4a_ftdi():
     cls._read = _read
 
 
+def _patch_usbserial4a_reset_input():
+    """usbserial4a's reset_input_buffer() purges the chip but keeps its own read buffer,
+    so stale replies survived it and put the next exchange out of step."""
+    from usbserial4a import (cdcacmserial4a, ch34xserial4a, cp210xserial4a, ftdiserial4a,
+                             pl2303serial4a)
+    for cls in (cdcacmserial4a.CdcAcmSerial, ch34xserial4a.Ch34xSerial,
+                cp210xserial4a.Cp210xSerial, ftdiserial4a.FtdiSerial,
+                pl2303serial4a.Pl2303Serial):
+        purge = cls.reset_input_buffer
+
+        def reset_input_buffer(self, purge=purge):
+            purge(self)
+            self._read_buffer = bytearray()
+
+        cls.reset_input_buffer = reset_input_buffer
+
+
 if IS_ANDROID:
     _patch_usbserial4a_ftdi()
+    _patch_usbserial4a_reset_input()
 
 
 class SpecError(Exception):
@@ -220,10 +239,32 @@ def _version_tuple(text):
     return tuple(parts)
 
 
+def open_port(port, baud, timeout):
+    """A pyserial style port object: pyserial on the desktop, usbserial4a on Android."""
+    if IS_ANDROID:
+        device = usb.get_usb_device(port)
+        while not usb.has_usb_permission(device):
+            usb.request_usb_permission(device)
+            time.sleep(1)
+        return serial4a.get_serial_port(port, baud, 8, 'N', 1, timeout=timeout)
+    # Exclusive, so a second opener fails loudly instead of splitting the data stream
+    # (POSIX only; Windows ports are exclusive anyway).
+    if os.name == 'posix':
+        return serial.Serial(port, baud, timeout=timeout, exclusive=True)
+    return serial.Serial(port, baud, timeout=timeout)
+
+
 def list_ports():
     if IS_ANDROID:
         return [d.getDeviceName() for d in usb.get_usb_device_list()]
     return [p.device for p in serial.tools.list_ports.comports()]
+
+
+def usb_serial_ports(ports=None):
+    """The ports that look like a USB serial adapter, best guess for the OSpRad first."""
+    if IS_ANDROID:
+        return [p for p in (ports or list_ports()) if 'USB' in p or 'ACM' in p]
+    return _likely_usb_ports()
 
 
 def _likely_usb_ports():
@@ -260,10 +301,7 @@ class SerialConnection:
             raise SpecError("No serial devices found; is the OSpRad plugged in?")
 
         if port is None:
-            if IS_ANDROID:
-                usb_ports = [p for p in ports if 'USB' in p or 'ACM' in p]
-            else:
-                usb_ports = _likely_usb_ports()
+            usb_ports = usb_serial_ports(ports)
             log.debug('ports: %s; USB serial: %s', ports, usb_ports)
             port = usb_ports[0] if usb_ports else ports[0]
             if not usb_ports:
@@ -279,23 +317,17 @@ class SerialConnection:
         self.firmware_version = ()
         log.info('Opening %s at 115200 (timeout %ss)', port, timeout)
 
-        if IS_ANDROID:
-            device = usb.get_usb_device(port)
-            while not usb.has_usb_permission(device):
-                usb.request_usb_permission(device)
-                time.sleep(1)
-            self._ser = serial4a.get_serial_port(port, 115200, 8, 'N', 1, timeout=timeout)
-        else:
-            try:
-                self._ser = serial.Serial(port, 115200, timeout=timeout)
-            except (serial.SerialException, OSError) as exc:
-                # Raw pyserial errors aren't actionable; usually another program
-                # holds the port.
-                raise SpecError(
-                    "Could not open %s (%s).\n\nThis usually means another program "
-                    "has the port open (close the Arduino IDE's Serial Monitor or any "
-                    "other OSpRad window) or that the USB driver isn't installed. "
-                    "Unplug and replug the OSpRad, then try again." % (port, exc)) from exc
+        try:
+            self._ser = open_port(port, 115200, timeout)
+        except (_TransportError, OSError) as exc:
+            if IS_ANDROID:
+                raise
+            # Raw pyserial errors aren't actionable; usually another program holds the port.
+            raise SpecError(
+                "Could not open %s (%s).\n\nThis usually means another program "
+                "has the port open (close the Arduino IDE's Serial Monitor or any "
+                "other OSpRad window) or that the USB driver isn't installed. "
+                "Unplug and replug the OSpRad, then try again." % (port, exc)) from exc
 
         # Opening the port resets the Nano. Wait out the bootloader before talking.
         log.debug('Port open, waiting 2.5s for the bootloader')
@@ -487,8 +519,8 @@ class SerialConnection:
             raise SpecProtocolError(
                 "The OSpRad on %s did not respond to a configuration request (%s).\n\n"
                 "This usually means it is running an older firmware without the "
-                "configuration protocol. Flash %s onto the Arduino Nano using the "
-                "Arduino IDE, then reconnect."
+                "configuration protocol. Flash the firmware from More > Updates (or "
+                "flash %s with the Arduino IDE), then reconnect."
                 % (self.port, exc, FIRMWARE_HINT)) from exc
 
         try:
@@ -498,7 +530,7 @@ class SerialConnection:
         if major != REQUIRED_FIRMWARE_MAJOR:
             raise SpecProtocolError(
                 "OSpRad is running firmware %s but this app needs %d.x. "
-                "Please reflash %s via the Arduino IDE."
+                "Flash it from More > Updates (or flash %s with the Arduino IDE)."
                 % (config.firmware, REQUIRED_FIRMWARE_MAJOR, FIRMWARE_HINT))
 
         try:

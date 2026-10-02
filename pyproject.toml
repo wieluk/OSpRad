@@ -34,6 +34,8 @@ package-dir = { "" = "app" }
 py-modules = [
     "OSpRad",
     "_calibration_data_bundled",
+    "_firmware_bundled",
+    "_font_bundled",
     "_icon_bundled",
     "_version",
     "analysis",
@@ -43,12 +45,17 @@ py-modules = [
     "cie_cmf",
     "datalog",
     "file_io",
+    "flasher",
     "monitor_calibration",
     "plotting",
     "qt_worker",
     "serial_io",
+    "shell",
+    "theme",
     "touch",
     "ui",
+    "updates",
+    "updates_page",
 ]
 
 [tool.setuptools.dynamic]

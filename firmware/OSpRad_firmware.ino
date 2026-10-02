@@ -11,7 +11,7 @@
 #include <EEPROM.h>
 Servo myservo;
 
-#define FIRMWARE_VERSION "1.1.0"
+#define FIRMWARE_VERSION "1.1.1"
 
 
 // EEPROM layout: each *_ADDR holds one int (2 bytes).
@@ -209,9 +209,6 @@ void setup(){
   digitalWrite(STpin, LOW);
 
   Serial.begin(115200);
-  // Newline terminated commands (see loop()), so this only ever gets hit by a
-  // malformed or incomplete command. Keep it short so that fails fast.
-  Serial.setTimeout(200);
   while (! Serial);
   // Timed over 480 pulses since micros() only resolves 4us.
   unsigned long t0 = micros();
@@ -541,12 +538,39 @@ void takeMeasurement(int type, bool live){
 }
 
 
+// Only a complete, printable, newline terminated line counts as a command. The old
+// timeout based read also ran input that never ended (line noise, or a flasher whose
+// bootloader had already exited), and commands like 'u' write EEPROM.
+String pendingLine;
+bool pendingBad = false;
+unsigned long lastByteMs = 0;
+
+String readCommand(){
+  while(Serial.available()){
+    char c = Serial.read();
+    lastByteMs = millis();
+    if(c == '\n'){
+      String line = pendingBad ? String() : pendingLine;
+      pendingLine = "";
+      pendingBad = false;
+      return line;
+    }
+    if((c < 32 && c != '\r') || c > 126 || pendingLine.length() >= 64)
+      pendingBad = true;
+    else
+      pendingLine += c;
+  }
+  if(millis() - lastByteMs > 200){ // an unfinished line is dropped, not run
+    pendingLine = "";
+    pendingBad = false;
+  }
+  return String();
+}
+
+
 void loop(){
 
-
-  // Newline terminated: parses one command per call instead of readString()'s old
-  // ~1s silence behaviour. See the 1.0.0 changelog.
-  String arg = Serial.readStringUntil('\n');
+  String arg = readCommand();
   arg.trim();
 
   if (arg.length() > 0){
